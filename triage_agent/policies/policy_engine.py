@@ -91,7 +91,7 @@ class PolicyEngine:
     Typical Usage:
         >>> engine = PolicyEngine(policies=[SafetyPolicy(), NoveltyPolicy()])
         >>> decision = engine.evaluate(agent_state)
-        >>> print(f"{decision.action}: {decision.rationale}")
+        >>> print(f"{decision.decision_type}: {decision.rationale}")
     
     Attributes:
         policies: Ordered list of Policy objects to evaluate
@@ -170,7 +170,7 @@ class PolicyEngine:
                 # Decisive policy found
                 logger.info(
                     f"Policy {policy.__class__.__name__} produced decision: "
-                    f"{decision.action.name}"
+                    f"{decision.decision_type.name}"
                 )
                 self._log_decision_provenance(state, decision, policy)
                 return decision
@@ -236,7 +236,7 @@ class PolicyEngine:
         }
         
         return Decision(
-            action=self.default_action,
+            decision_type=self.default_action,
             rationale=rationale,
             metadata=metadata
         )
@@ -260,7 +260,7 @@ class PolicyEngine:
         """
         provenance = {
             "identifier": state.identifier,
-            "decision_action": decision.action.name,
+            "decision_action": decision.decision_type.name,
             "policy": policy.__class__.__name__ if policy else "fallback",
             "num_tool_results": len(state.tool_results),
             "tool_names": list(state.tool_results.keys())

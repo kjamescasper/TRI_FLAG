@@ -18,14 +18,10 @@ Constraints:
     - Must NOT contain domain-specific assumptions (stay generic)
 """
 
-# Import dataclass for clean, structured class definition with less boilerplate
 from dataclasses import dataclass, field
-# Import type hints for better code documentation and IDE support
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
-
-# Using @dataclass decorator automatically generates __init__, __repr__, __eq__, etc.
-# This reduces boilerplate code while maintaining clarity
 @dataclass
 class AgentState:
     """
@@ -37,6 +33,7 @@ class AgentState:
     - Tool execution results
     - Human-readable messages for traceability
     - Final decision object
+    - Execution metadata and state flags
 
     The state is designed to be mutable and incrementally updated as the
     agent progresses through its evaluation workflow.
@@ -54,17 +51,16 @@ class AgentState:
                   Provides a chronological narrative of what the agent did
         decision: Final decision object produced by the agent (None until set)
                   Remains None during evaluation, set once at the end
+        _tools_complete: Internal flag indicating all tools have finished execution
+        _terminated: Internal flag for early termination signal
+        _decision_set: Internal flag indicating decision has been finalized
     """
 
     # Required fields - must be provided when creating an AgentState instance
-    # These identify what molecule we're working with and what data we started with
     molecule_id: str  # Unique identifier for tracking and logging
     raw_input: Any    # Original input data - kept for auditability
 
     # Optional fields with default factories - automatically initialized as empty
-    # Using field(default_factory=dict) instead of {} prevents mutable default argument issues
-    # All instances get their own separate dict/list, not a shared reference
-    
     tool_results: Dict[str, Any] = field(default_factory=dict)
     # Stores outputs from each tool that runs
     # Example: {"toxicity_predictor": {"score": 0.23}, "solubility_check": {"soluble": True}}
@@ -75,8 +71,19 @@ class AgentState:
 
     decision: Optional[Any] = None
     # Final outcome - starts as None, gets set exactly once at the end
-    # Optional[Any] means it can be None or any type
-    # Example: {"accept": True, "confidence": 0.87, "reason": "Low toxicity"}
+    
+    #time tracking
+    execution_start_time: Optional[datetime] = None
+
+    # Internal state tracking flags (Week 2 additions for TriageAgent)
+    # These are prefixed with _ to indicate they're internal/private
+    _tools_complete: bool = field(default=False, repr=False)
+    _terminated: bool = field(default=False, repr=False)
+    _decision_set: bool = field(default=False, repr=False)
+
+    # =========================================================================
+    # Core Methods (Original Design)
+    # =========================================================================
 
     def add_tool_result(self, tool_name: str, result: Any) -> None:
         """
@@ -108,9 +115,42 @@ class AgentState:
             If the same tool_name is used twice, the second call overwrites
             the first result. This is intentional - tools shouldn't run twice.
         """
-        # Simple dictionary assignment - store the result under the tool's name
-        # This creates or updates the entry for this tool
         self.tool_results[tool_name] = result
+
+    def get_decision_timestamp(self) -> Optional[datetime]:
+        """
+        Get the timestamp when the decision was set.
+    
+        Returns:
+           Timezone-aware datetime when decision was set, or None
+        """
+        if self.decision is None:
+            return None
+    
+        # Try to get timestamp from decision metadata
+        if hasattr(self.decision, 'metadata') and isinstance(self.decision.metadata, dict):
+            timestamp = self.decision.metadata.get('timestamp')
+            if timestamp:
+                # If it's a string (ISO format), parse it to datetime
+                if isinstance(timestamp, str):
+                    try:
+                        # Parse ISO format and ensure timezone awareness
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        # If no timezone, add UTC
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except:
+                        pass
+                # If it's already a datetime, return it
+                elif isinstance(timestamp, datetime):
+                    # Ensure timezone awareness
+                    if timestamp.tzinfo is None:
+                        return timestamp.replace(tzinfo=timezone.utc)
+                    return timestamp
+    
+        # Fallback: return current time with timezone
+        return datetime.now(timezone.utc)
 
     def add_message(self, message: str) -> None:
         """
@@ -144,8 +184,6 @@ class AgentState:
             Messages are appended in order, creating a timeline of events.
             This preserves the sequence of operations for later analysis.
         """
-        # Append to the list - maintains chronological order
-        # Each message gets added to the end of the list
         self.messages.append(message)
 
     def set_decision(self, decision: Any) -> None:
@@ -183,6 +221,250 @@ class AgentState:
             Calling it multiple times will overwrite the previous decision.
             Consider adding validation in future versions if this becomes an issue.
         """
-        # Direct assignment - replace whatever was there before (usually None)
-        # This marks the transition from "evaluating" to "decided"
         self.decision = decision
+        self._decision_set = True
+
+    @property
+    def identifier(self) -> str:
+        """
+        Alias for molecule_id to support PolicyEngine interface compatibility.
+        
+        The PolicyEngine expects state.identifier for validation and logging.
+        This property provides that interface while keeping molecule_id as the
+        canonical field name in AgentState.
+        
+        Returns:
+            The molecule identifier (same as molecule_id)
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.identifier
+            "MOL_001"
+            >>> state.identifier == state.molecule_id
+            True
+        """
+        return self.molecule_id
+
+    # =========================================================================
+    # Week 2 Extensions: State Management Methods
+    # These methods support TriageAgent's execution flow tracking
+    # =========================================================================
+    
+    def set_tools_complete(self, timestamp: Optional[str] = None) -> None:
+        """
+        Mark that all tools have completed execution.
+        
+        This signals the transition from tool execution phase to policy
+        evaluation phase. Optional timestamp can be provided for audit trail.
+        
+        Args:
+            timestamp: Optional ISO format timestamp when tools completed
+        
+        Returns:
+            None - modifies state in place
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.set_tools_complete(timestamp="2024-02-09T15:30:00Z")
+            >>> state.is_tools_complete()
+            True
+        """
+        self._tools_complete = True
+        if timestamp:
+            self.add_message(f"All tools completed at {timestamp}")
+
+    def is_tools_complete(self) -> bool:
+        """
+        Check if all tools have completed execution.
+        
+        Returns:
+            True if tools are complete, False otherwise
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.is_tools_complete()
+            False
+            >>> state.set_tools_complete()
+            >>> state.is_tools_complete()
+            True
+        """
+        return self._tools_complete
+
+    def terminate(self, reason: Optional[str] = None) -> None:
+        """
+        Signal early termination of agent execution.
+        
+        Sets internal flag that can be checked by the agent to stop
+        execution early. Optional reason can be provided for logging.
+        
+        Args:
+            reason: Optional explanation for why execution is terminating
+        
+        Returns:
+            None - modifies state in place
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.terminate(reason="Critical validation failure")
+            >>> state.is_terminated()
+            True
+        """
+        self._terminated = True
+        if reason:
+            self.add_message(f"Early termination: {reason}")
+
+    def is_terminated(self) -> bool:
+        """
+        Check if early termination has been signaled.
+        
+        Returns:
+            True if terminated, False otherwise
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.is_terminated()
+            False
+            >>> state.terminate()
+            >>> state.is_terminated()
+            True
+        """
+        return self._terminated
+
+    def is_decision_set(self) -> bool:
+        """
+        Check if a decision has been finalized.
+        
+        Returns:
+            True if decision has been set, False otherwise
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.is_decision_set()
+            False
+            >>> state.set_decision({"accept": True})
+            >>> state.is_decision_set()
+            True
+        """
+        return self._decision_set
+
+    def tool_result(self, tool_name: str) -> Optional[Any]:
+        """
+        Retrieve the result from a specific tool.
+        
+        Args:
+            tool_name: Name of the tool whose result to retrieve
+        
+        Returns:
+            Tool result if found, None otherwise
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.add_tool_result("toxicity", {"score": 0.23})
+            >>> state.tool_result("toxicity")
+            {"score": 0.23}
+            >>> state.tool_result("nonexistent")
+            None
+        """
+        return self.tool_results.get(tool_name)
+
+    def has_tool_result(self, tool_name: str) -> bool:
+        """
+        Check if a specific tool has produced a result.
+        
+        Args:
+            tool_name: Name of the tool to check
+        
+        Returns:
+            True if tool result exists, False otherwise
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.add_tool_result("toxicity", {"score": 0.23})
+            >>> state.has_tool_result("toxicity")
+            True
+            >>> state.has_tool_result("nonexistent")
+            False
+        """
+        return tool_name in self.tool_results
+
+    def get_all_messages(self) -> List[str]:
+        """
+        Retrieve all messages in chronological order.
+        
+        Returns:
+            List of all messages
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.add_message("First message")
+            >>> state.add_message("Second message")
+            >>> state.get_all_messages()
+            ["First message", "Second message"]
+        """
+        return self.messages.copy()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert state to dictionary for serialization.
+        
+        Useful for:
+        - JSON serialization for API responses
+        - Database storage
+        - Logging and debugging
+        
+        Returns:
+            Dictionary representation of the state
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={"smiles": "CCO"})
+            >>> state.add_message("Test message")
+            >>> state_dict = state.to_dict()
+            >>> state_dict["molecule_id"]
+            "MOL_001"
+        """
+        return {
+            "molecule_id": self.molecule_id,
+            "raw_input": self.raw_input,
+            "tool_results": self.tool_results,
+            "messages": self.messages,
+            "decision": self.decision,
+            "tools_complete": self._tools_complete,
+            "terminated": self._terminated,
+            "decision_set": self._decision_set
+        }
+
+
+# =============================================================================
+# Design Notes (Week 2)
+# =============================================================================
+#
+# Changes from original AgentState:
+# ---------------------------------
+# 1. Added state tracking flags (_tools_complete, _terminated, _decision_set)
+#    - These support TriageAgent's execution flow control
+#    - Prefixed with _ to indicate internal use
+#    - repr=False keeps them out of default string representation
+#
+# 2. Added query methods (is_terminated, is_tools_complete, etc.)
+#    - Provides clean API for checking state without direct flag access
+#    - Supports future extension (e.g., logging when flags are checked)
+#
+# 3. Added helper methods (tool_result, has_tool_result, etc.)
+#    - Convenience methods that TriageAgent expects
+#    - Maintains consistency with original design (explicit methods, not magic)
+#
+# 4. Updated set_decision to set the _decision_set flag
+#    - Allows agent to detect when decision has been finalized
+#    - Supports immutability enforcement in future versions
+#
+# Why these changes maintain the original design philosophy:
+# ----------------------------------------------------------
+# - Still a data container (no computation or policy logic)
+# - Still generic (no domain-specific assumptions)
+# - Still explicit (all state changes via clear method calls)
+# - Still reproducible (all state is serializable via to_dict)
+# - Still modular (tools and policies don't depend on each other)
+#
+# The additions are purely mechanical bookkeeping to support orchestration,
+# not domain logic or decision-making.
+#

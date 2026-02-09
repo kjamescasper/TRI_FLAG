@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
 
+import logging
+from agent.agent_state import AgentState
+from agent.decision import Decision, DecisionType
+from policies.policy_engine import PolicyEngine
+from tools.base_tool import Tool
 
 class ToolExecutionStatus(Enum):
     """Status codes for tool execution outcomes."""
@@ -121,7 +126,7 @@ class TriageAgent:
             ValueError: If tools list is empty or contains duplicate tool names
         """
         if not tools:
-            raise ValueError("TriageAgent requires at least one tool")
+            logger.warning("TriageAgent initialized with 0 tools - architectural validation mode")
         
         # Validate no duplicate tool names
         tool_names = [tool.get_name() for tool in tools]
@@ -168,7 +173,7 @@ class TriageAgent:
         state = AgentState(
             molecule_id=molecule_id,
             raw_input=raw_input,
-            execution_start_time=self._get_timestamp()
+            execution_start_time=datetime.now(timezone.utc)  # Adds time tracking
         )
         
         self.logger.info(
@@ -185,7 +190,7 @@ class TriageAgent:
                     extra={
                         "molecule_id": molecule_id,
                         "termination_reason": state.get_termination_reason(),
-                        "tools_completed": len(state.get_tool_results())
+                        "tools_completed": len(state.tool_results)
                     }
                 )
                 break
@@ -301,14 +306,16 @@ class TriageAgent:
                 raise
         
         # Mark tool execution phase complete
-        state.set_tools_complete(timestamp=self._get_timestamp())
+        #, no tools to implement, put back in later: state.set_tools_complete(timestamp=self._get_timestamp())
+        
+        state.add_message(f"All tools completed at {self._get_timestamp()}")
         
         self.logger.info(
             f"Tool execution phase complete for molecule_id={molecule_id}",
             extra={
                 "molecule_id": molecule_id,
                 "total_tools": len(self.tools),
-                "executed_tools": len(state.get_tool_results()),
+                "executed_tools": len(state.tool_results),
                 "early_termination": state.is_terminated()
             }
         )
@@ -326,10 +333,10 @@ class TriageAgent:
             self._validate_decision(decision)
             
             self.logger.info(
-                f"Policy evaluation complete: {decision.outcome}",
+                f"Policy evaluation complete: {decision.decision_type}",
                 extra={
                     "molecule_id": molecule_id,
-                    "decision_outcome": decision.outcome,
+                    "decision_decision_type": decision.decision_type,
                     "decision_confidence": getattr(decision, 'confidence', None)
                 }
             )
@@ -368,9 +375,9 @@ class TriageAgent:
             f"Triage run complete for molecule_id={molecule_id}",
             extra={
                 "molecule_id": molecule_id,
-                "decision_outcome": decision.outcome,
+                "decision_decision_type": decision.decision_type,
                 "total_tools": len(self.tools),
-                "executed_tools": len(state.get_tool_results()),
+                "executed_tools": len(state.tool_results),
                 "failed_tools": self._count_failed_tools(state),
                 "total_execution_time_ms": total_execution_time_ms,
                 "early_termination": state.is_terminated()
@@ -405,27 +412,35 @@ class TriageAgent:
         elapsed = (end_dt - start_dt).total_seconds() * 1000
         return round(elapsed, 2)
     
-    def _compute_total_execution_time(self, state: 'AgentState') -> float:
-        """
-        Calculate total execution time from state timestamps.
-        
-        Args:
-            state: Finalized agent state with execution timestamps
-        
-        Returns:
-            Total execution time in milliseconds
-        """
+    def _compute_total_execution_time(self, state: AgentState) -> float:
+    ### Compute total execution time in milliseconds.
+    
+    # Args:
+    #    state: AgentState with execution timestamps
+    
+    # Returns:
+    #    Execution time in milliseconds
+
         start_time = state.execution_start_time
         end_time = state.get_decision_timestamp()
-        
-        if not end_time:
-            # Fallback: use current time if decision timestamp unavailable
-            end_time = self._get_timestamp()
-        
-        start_dt = datetime.fromisoformat(start_time)
-        end_dt = datetime.fromisoformat(end_time)
-        elapsed = (end_dt - start_dt).total_seconds() * 1000
-        return round(elapsed, 2)
+    
+        if start_time is None or end_time is None:
+            return 0.0
+    
+    # Handle both datetime objects and ISO strings
+        if isinstance(start_time, str):
+            start_dt = datetime.fromisoformat(start_time)
+        else:
+            start_dt = start_time
+    
+        if isinstance(end_time, str):
+            end_dt = datetime.fromisoformat(end_time)
+        else:
+            end_dt = end_time
+    
+    # Compute difference in milliseconds
+        time_diff = (end_dt - start_dt).total_seconds() * 1000
+        return time_diff
     
     def _validate_tool_result(self, result: any, tool_name: str) -> None:
         """
@@ -460,8 +475,8 @@ class TriageAgent:
         if decision is None:
             raise StateValidationError("PolicyEngine returned None decision")
         
-        if not hasattr(decision, 'outcome'):
-            raise StateValidationError("Decision missing required 'outcome' field")
+        if not hasattr(decision, 'decision_type'):
+            raise StateValidationError("Decision missing required 'decision_type' field")
     
     def _count_failed_tools(self, state: 'AgentState') -> int:
         """
@@ -474,7 +489,7 @@ class TriageAgent:
             Number of tools with FAILURE status
         """
         failed_count = 0
-        for result in state.get_tool_results().values():
+        for result in state.tool_results.values():
             if isinstance(result, ToolResult) and result.status == ToolExecutionStatus.FAILURE:
                 failed_count += 1
         return failed_count

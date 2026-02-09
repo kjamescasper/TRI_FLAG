@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import logging
 
 from agent.agent_state import AgentState
-from agent.decision import Decision, DecisionAction
+from agent.decision import Decision, DecisionType
 
 
 # Configure module logger
@@ -101,7 +101,7 @@ class PolicyEngine:
     def __init__(
         self,
         policies: Optional[List[Policy]] = None,
-        default_action: DecisionAction = DecisionAction.FLAG
+        default_action: DecisionType = DecisionType.FLAG
     ):
         """
         Initialize the PolicyEngine with an ordered policy sequence.
@@ -116,13 +116,13 @@ class PolicyEngine:
             ValueError: If default_action is invalid
         """
         self.policies: List[Policy] = policies or []
-        self.default_action: DecisionAction = default_action
+        self.default_action: DecisionType = default_action
         
         # Validate default action
-        if not isinstance(default_action, DecisionAction):
+        if not isinstance(default_action, DecisionType):
             raise ValueError(
                 f"Invalid default_action: {default_action}. "
-                f"Must be a DecisionAction enum member."
+                f"Must be a DecisionType enum member."
             )
         
         logger.info(
@@ -337,7 +337,7 @@ class PlaceholderPolicy:
             toxicity_result = state.tool_results.get('toxicity_predictor')
             if toxicity_result and toxicity_result['score'] > threshold:
                 return Decision(
-                    action=DecisionAction.FLAG,
+                    action=DecisionType.FLAG,
                     rationale=f"Toxicity score {score} exceeds threshold",
                     metadata={'toxicity_score': score}
                 )

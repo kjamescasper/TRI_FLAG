@@ -111,8 +111,16 @@ def initialize_agent(tools: List[Tool], policy_engine: PolicyEngine) -> TriageAg
         - Separates object construction from usage
         - Documents required dependencies clearly
         - Agent owns orchestration logic, not construction
+        - Logger is created specifically for the agent's use
     """
-    agent = TriageAgent(tools=tools, policy_engine=policy_engine)
+    # Create a logger specifically for the TriageAgent
+    agent_logger = logging.getLogger("agent.triage_agent")
+    
+    agent = TriageAgent(
+        tools=tools,
+        policy_engine=policy_engine,
+        logger=agent_logger
+    )
     logging.info("TriageAgent initialized with dependencies")
     return agent
 

@@ -222,7 +222,52 @@ class TriageAgent:
                     tool_name=tool_name,
                     result=result
                 )
+                # ═══════════════════════════════════════════════════════════════
+            # WEEK 3 ADDITION: Check for validity tool failure
+            # ═══════════════════════════════════════════════════════════════
+                if tool_name == "ValidityTool":
+                # Extract validity result from tool output
+                    if isinstance(result, ToolResult):
+                        validity_data = result.data
+                    else:
+                        validity_data = result
                 
+                    is_valid = validity_data.get('is_valid', False)
+                
+                    if not is_valid:
+                        # Molecule is chemically invalid - terminate early
+                        error_msg = validity_data.get('error_message', 'Unknown validation error')
+                    
+                        state.add_message(
+                            f"Molecule failed validity check: {error_msg}"
+                        )
+                        state.terminate(reason=f"Invalid chemistry: {error_msg}")
+                    
+                        self.logger.warning(
+                            f"Terminating early for {molecule_id}: molecule is chemically invalid",
+                            extra={
+                                "molecule_id": molecule_id,
+                                "validation_error": error_msg,
+                                "tools_completed": len(state.tool_results)
+                            }
+                        )
+                        # Break out of tool loop - don't run any more tools
+                        break
+                    else:
+                        # Molecule is valid - log and continue
+                        canonical_smiles = validity_data.get('smiles_canonical', 'N/A')
+                        num_atoms = validity_data.get('num_atoms', 0)
+                    
+                    self.logger.info(
+                        f"Molecule {molecule_id} passed validity check",
+                        extra={
+                            "molecule_id": molecule_id,
+                            "canonical_smiles": canonical_smiles,
+                            "num_atoms": num_atoms
+                        }
+                    )
+            # ═══════════════════════════════════════════════════════════════
+            # END WEEK 3 ADDITION
                 self.logger.info(
                     f"Tool {tool_name} completed successfully",
                     extra={

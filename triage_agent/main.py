@@ -73,7 +73,10 @@ def initialize_tools() -> List[Tool]:
             SynthesisTool(config={"database": "reaxys"}),
         ]
     """
-    tools: List[Tool] = []
+    tools: List[Tool] = [
+        validity_tool(),  # MUST be first
+        # Future tools will go here (SA Score, Similarity, etc.)
+    ]
     logging.info(f"Initialized {len(tools)} tools")
     return tools
 
@@ -211,3 +214,4 @@ if __name__ == "__main__":
         - Future CLI wrappers
     """
     main()
+

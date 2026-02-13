@@ -157,6 +157,19 @@ class PolicyEngine:
         """
         # Step 1: Validate input state
         self._validate_state(state)
+        # NEW WEEK 3: Check if molecule failed validity check
+        validity_result = state.get_tool_result('ValidityTool')
+        if validity_result and not validity_result.get('is_valid', False):
+        # Molecule is chemically invalid - automatic discard
+            error_msg = validity_result.get('error_message', 'Unknown validation error')
+            return Decision(
+                decision_type=DecisionType.DISCARD,
+                rationale=f"Chemically invalid molecule: {error_msg}",
+                metadata={
+                    'termination_reason': 'validity_check_failed',
+                    'validity_error': error_msg
+                }
+            )
         
         logger.debug(f"Evaluating state for identifier: {state.identifier}")
         

@@ -30,6 +30,7 @@ from agent.agent_state import AgentState
 from agent.triage_agent import TriageAgent
 from policies.policy_engine import PolicyEngine
 from tools.base_tool import Tool
+from tools.validity_tool import ValidityTool
 
 
 def configure_logging() -> None:
@@ -73,7 +74,14 @@ def initialize_tools() -> List[Tool]:
             SynthesisTool(config={"database": "reaxys"}),
         ]
     """
+<<<<<<< Updated upstream
     tools: List[Tool] = []
+=======
+    tools: List[Tool] = [
+        ValidityTool(),  # MUST be first
+        # Future tools will go here (SA Score, Similarity, etc.)
+    ]
+>>>>>>> Stashed changes
     logging.info(f"Initialized {len(tools)} tools")
     return tools
 
@@ -150,7 +158,7 @@ def run_smoke_test(agent: TriageAgent) -> None:
     # Placeholder inputs for Week 2 - no chemistry logic required
     # Agent is expected to handle None gracefully and make a default decision
     molecule_id = "TEST_MOLECULE_001"
-    raw_input = None
+    raw_input = "CCO" # Ethanol
     
     logging.info(f"Running triage for molecule_id='{molecule_id}'")
     

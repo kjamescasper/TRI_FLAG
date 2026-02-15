@@ -129,7 +129,7 @@ class TriageAgent:
             logger.warning("TriageAgent initialized with 0 tools - architectural validation mode")
         
         # Validate no duplicate tool names
-        tool_names = [tool.get_name() for tool in tools]
+        tool_names = [tool.name for tool in tools]
         if len(tool_names) != len(set(tool_names)):
             duplicates = [name for name in tool_names if tool_names.count(name) > 1]
             raise ValueError(f"Duplicate tool names found: {set(duplicates)}")
@@ -195,7 +195,7 @@ class TriageAgent:
                 )
                 break
             
-            tool_name = tool.get_name()
+            tool_name = tool.name
             tool_start_time = self._get_timestamp()
             
             self.logger.debug(

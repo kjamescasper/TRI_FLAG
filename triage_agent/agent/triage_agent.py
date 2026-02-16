@@ -112,7 +112,7 @@ class TriageAgent:
         self,
         tools: List['Tool'],
         policy_engine: 'PolicyEngine',
-        logger: 'Logger'
+        logger
     ):
         """
         Initialize the triage agent with required dependencies.

@@ -51,6 +51,7 @@ class AgentState:
                   Provides a chronological narrative of what the agent did
         decision: Final decision object produced by the agent (None until set)
                   Remains None during evaluation, set once at the end
+        execution_start_time: Timestamp when execution began (for performance tracking)
         _tools_complete: Internal flag indicating all tools have finished execution
         _terminated: Internal flag for early termination signal
         _decision_set: Internal flag indicating decision has been finalized
@@ -72,10 +73,10 @@ class AgentState:
     decision: Optional[Any] = None
     # Final outcome - starts as None, gets set exactly once at the end
     
-    #time tracking
+    # Time tracking (Week 3 addition)
     execution_start_time: Optional[datetime] = None
 
-    # Internal state tracking flags (Week 2 additions for TriageAgent)
+    # Internal state tracking flags (Week 2-3 additions for TriageAgent)
     # These are prefixed with _ to indicate they're internal/private
     _tools_complete: bool = field(default=False, repr=False)
     _terminated: bool = field(default=False, repr=False)
@@ -246,7 +247,7 @@ class AgentState:
         return self.molecule_id
 
     # =========================================================================
-    # Week 2 Extensions: State Management Methods
+    # Week 2-3 Extensions: State Management Methods
     # These methods support TriageAgent's execution flow tracking
     # =========================================================================
     
@@ -330,6 +331,31 @@ class AgentState:
         """
         return self._terminated
 
+    def get_termination_reason(self) -> Optional[str]:
+        """
+        Get the reason for early termination if terminated.
+        
+        Searches messages in reverse chronological order for termination message.
+        
+        Returns:
+            Termination reason from messages, or None if not terminated
+        
+        Example:
+            >>> state = AgentState(molecule_id="MOL_001", raw_input={})
+            >>> state.terminate(reason="Invalid chemistry")
+            >>> state.get_termination_reason()
+            "Early termination: Invalid chemistry"
+        """
+        if not self._terminated:
+            return None
+        
+        # Look for termination message (search backwards for most recent)
+        for msg in reversed(self.messages):
+            if "termination" in msg.lower():
+                return msg
+        
+        return "Early termination (reason not specified)"
+
     def is_decision_set(self) -> bool:
         """
         Check if a decision has been finalized.
@@ -347,7 +373,7 @@ class AgentState:
         """
         return self._decision_set
 
-    def tool_result(self, tool_name: str) -> Optional[Any]:
+    def get_tool_result(self, tool_name: str) -> Optional[Any]:
         """
         Retrieve the result from a specific tool.
         
@@ -360,9 +386,9 @@ class AgentState:
         Example:
             >>> state = AgentState(molecule_id="MOL_001", raw_input={})
             >>> state.add_tool_result("toxicity", {"score": 0.23})
-            >>> state.tool_result("toxicity")
+            >>> state.get_tool_result("toxicity")
             {"score": 0.23}
-            >>> state.tool_result("nonexistent")
+            >>> state.get_tool_result("nonexistent")
             None
         """
         return self.tool_results.get(tool_name)
@@ -428,6 +454,7 @@ class AgentState:
             "tool_results": self.tool_results,
             "messages": self.messages,
             "decision": self.decision,
+            "execution_start_time": self.execution_start_time.isoformat() if self.execution_start_time else None,
             "tools_complete": self._tools_complete,
             "terminated": self._terminated,
             "decision_set": self._decision_set
@@ -435,7 +462,7 @@ class AgentState:
 
 
 # =============================================================================
-# Design Notes (Week 2)
+# Design Notes (Week 2-3)
 # =============================================================================
 #
 # Changes from original AgentState:
@@ -449,11 +476,19 @@ class AgentState:
 #    - Provides clean API for checking state without direct flag access
 #    - Supports future extension (e.g., logging when flags are checked)
 #
-# 3. Added helper methods (tool_result, has_tool_result, etc.)
-#    - Convenience methods that TriageAgent expects
+# 3. Added helper methods (get_tool_result, has_tool_result, etc.)
+#    - Convenience methods that TriageAgent and PolicyEngine expect
 #    - Maintains consistency with original design (explicit methods, not magic)
 #
-# 4. Updated set_decision to set the _decision_set flag
+# 4. Added execution_start_time field (Week 3)
+#    - Enables performance tracking and timing analysis
+#    - Used to compute total execution time
+#
+# 5. Added get_termination_reason() method (Week 3)
+#    - Allows agent to report WHY it terminated early
+#    - Useful for debugging and user feedback
+#
+# 6. Updated set_decision to set the _decision_set flag
 #    - Allows agent to detect when decision has been finalized
 #    - Supports immutability enforcement in future versions
 #

@@ -157,8 +157,6 @@ class PolicyEngine:
         """
         # Step 1: Validate input state
         self._validate_state(state)
-<<<<<<< Updated upstream
-=======
         # NEW WEEK 3: Check if molecule failed validity check
         validity_result = state.tool_results.get('ValidityTool')
         if validity_result and not validity_result.get('is_valid', False):
@@ -172,7 +170,6 @@ class PolicyEngine:
                     'validity_error': error_msg
                 }
             )
->>>>>>> Stashed changes
         
         logger.debug(f"Evaluating state for identifier: {state.identifier}")
         

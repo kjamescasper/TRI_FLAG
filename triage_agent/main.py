@@ -6,7 +6,7 @@ Entry point for the TRI_FLAG agentic research system.
 This script serves as an architectural smoke test, demonstrating that the
 core components (TriageAgent, PolicyEngine, Tools) can be wired together
 and executed end-to-end. It contains no domain logic and uses placeholder
-inputs suitable for Week 2 architectural validation.
+inputs suitable for Week 2-3 architectural validation.
 
 Usage:
     python main.py
@@ -19,7 +19,7 @@ Expected behavior:
     - Exits cleanly
 
 Author: TRI_FLAG Research Team
-Week: 2 (Architecture Validation)
+Week: 3 (Chemical Validity Checking)
 """
 
 import logging
@@ -60,28 +60,28 @@ def initialize_tools() -> List[Tool]:
     """
     Initialize the tool registry.
     
+    Week 3: ValidityTool is registered FIRST to ensure
+    invalid molecules are rejected before expensive computations.
+    
     Returns:
-        Empty list for Week 2 (no tools implemented yet)
+        List of tools in execution order
     
     Rationale:
         - Explicit function makes future tool registration trivial
         - Returning empty list validates that agent handles zero tools
         - Type annotation ensures architectural contract is maintained
         
-    Future usage (Week 3+):
+    Future usage (Week 4+):
         tools = [
-            ToxicityTool(config={"threshold": 0.7}),
-            SynthesisTool(config={"database": "reaxys"}),
+            ValidityTool(),  # Always first
+            SAScoreTool(),
+            SimilarityTool(),
         ]
     """
-<<<<<<< Updated upstream
-    tools: List[Tool] = []
-=======
     tools: List[Tool] = [
         ValidityTool(),  # MUST be first
         # Future tools will go here (SA Score, Similarity, etc.)
     ]
->>>>>>> Stashed changes
     logging.info(f"Initialized {len(tools)} tools")
     return tools
 
@@ -142,10 +142,10 @@ def run_smoke_test(agent: TriageAgent) -> None:
         agent: Configured TriageAgent instance
     
     Raises:
-        Any exception from agent.run() (fail-fast behavior for Week 2)
+        Any exception from agent.run() (fail-fast behavior for Week 3)
     
     Rationale:
-        - Uses placeholder inputs appropriate for Week 2
+        - Uses valid SMILES for Week 3 chemistry validation
         - Validates that agent.run() executes without exceptions
         - Logs outcome for traceability
         - Does not validate correctness of decision (that's a unit test concern)
@@ -155,15 +155,14 @@ def run_smoke_test(agent: TriageAgent) -> None:
     logging.info("Starting architectural smoke test")
     logging.info("=" * 60)
     
-    # Placeholder inputs for Week 2 - no chemistry logic required
-    # Agent is expected to handle None gracefully and make a default decision
+    # Week 3: Use valid SMILES for chemistry validation
     molecule_id = "TEST_MOLECULE_001"
-    raw_input = "CCO" # Ethanol
+    raw_input = "CCO"  # Ethanol - simple valid molecule
     
     logging.info(f"Running triage for molecule_id='{molecule_id}'")
     
     # Execute the full pipeline
-    # Note: We allow exceptions to propagate (fail-fast for Week 2)
+    # Note: We allow exceptions to propagate (fail-fast for Week 3)
     decision = agent.run(molecule_id=molecule_id, raw_input=raw_input)
     
     # Log the outcome using Decision.__str__() implementation
@@ -187,7 +186,7 @@ def main() -> None:
     All domain logic belongs in agent, tools, or policy modules.
     
     Error handling:
-        - Exceptions propagate to caller (fail-fast for Week 2)
+        - Exceptions propagate to caller (fail-fast for Week 3)
         - Full stack traces visible for debugging
         - No graceful degradation at this stage
     """

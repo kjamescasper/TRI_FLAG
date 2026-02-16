@@ -1,16 +1,16 @@
 """
 TriageAgent: Central orchestration controller for molecular triage workflow.
 
-Week 2 Implementation - Core Architecture
+Week 3 Implementation - Chemical Validity Checking Integration
 This module implements the deterministic, state-centric agent that coordinates
 tool execution, maintains provenance, and delegates decision-making.
 
 Design Principles:
-- Tools execute sequentially in fixed order (no parallelism in Week 2)
+- Tools execute sequentially in fixed order (no parallelism)
 - Tools are stateless; AgentState is the single source of truth
 - Tool failures are non-terminal by default; execution continues with recorded errors
 - State becomes immutable after decision is set
-- Early termination allowed via explicit state signals only
+- Early termination allowed via explicit state signals (Week 3: invalid molecules)
 - PolicyEngine evaluates completed state; does not control execution flow
 """
 
@@ -90,8 +90,9 @@ class TriageAgent:
     to the policy engine. Ensures deterministic, auditable execution with
     complete provenance tracking.
     
-    Tool Execution Semantics (Week 2):
+    Tool Execution Semantics (Week 3):
     - Tools are executed sequentially in the order provided at construction
+    - ValidityTool runs first and can terminate execution early
     - No dependency management or parallel execution
     - Tool failures are non-terminal by default (execution continues)
     - Early termination is supported via explicit state signals
@@ -150,7 +151,7 @@ class TriageAgent:
         1. Initialize AgentState with molecule_id and raw_input
         2. Execute tools sequentially in fixed order
         3. Record all tool results (success or failure) in state
-        4. Check for early termination signals between tools
+        4. Check for early termination signals between tools (Week 3: invalid chemistry)
         5. Delegate decision-making to PolicyEngine
         6. Finalize and return immutable state
         
@@ -173,7 +174,7 @@ class TriageAgent:
         state = AgentState(
             molecule_id=molecule_id,
             raw_input=raw_input,
-            execution_start_time=datetime.now(timezone.utc)  # Adds time tracking
+            execution_start_time=datetime.now(timezone.utc)  # Week 3: time tracking
         )
         
         self.logger.info(
@@ -223,6 +224,54 @@ class TriageAgent:
                     result=result
                 )
                 
+                # ═══════════════════════════════════════════════════════════════
+                # WEEK 3 ADDITION: Check for validity tool failure
+                # ═══════════════════════════════════════════════════════════════
+                if tool_name == "ValidityTool":
+                    # Extract validity result from tool output
+                    if isinstance(result, ToolResult):
+                        validity_data = result.data
+                    else:
+                        validity_data = result
+                    
+                    is_valid = validity_data.get('is_valid', False)
+                    
+                    if not is_valid:
+                        # Molecule is chemically invalid - terminate early
+                        error_msg = validity_data.get('error_message', 'Unknown validation error')
+                        
+                        state.add_message(
+                            f"Molecule failed validity check: {error_msg}"
+                        )
+                        state.terminate(reason=f"Invalid chemistry: {error_msg}")
+                        
+                        self.logger.warning(
+                            f"Terminating early for {molecule_id}: molecule is chemically invalid",
+                            extra={
+                                "molecule_id": molecule_id,
+                                "validation_error": error_msg,
+                                "tools_completed": len(state.tool_results)
+                            }
+                        )
+                        # Break out of tool loop - don't run any more tools
+                        break
+                    else:
+                        # Molecule is valid - log and continue
+                        canonical_smiles = validity_data.get('smiles_canonical', 'N/A')
+                        num_atoms = validity_data.get('num_atoms', 0)
+                        
+                        self.logger.info(
+                            f"Molecule {molecule_id} passed validity check",
+                            extra={
+                                "molecule_id": molecule_id,
+                                "canonical_smiles": canonical_smiles,
+                                "num_atoms": num_atoms
+                            }
+                        )
+                # ═══════════════════════════════════════════════════════════════
+                # END WEEK 3 ADDITION
+                # ═══════════════════════════════════════════════════════════════
+                
                 self.logger.info(
                     f"Tool {tool_name} completed successfully",
                     extra={
@@ -261,7 +310,7 @@ class TriageAgent:
                 )
                 
                 # Check tool failure mode policy
-                failure_mode = tool.get_failure_mode()
+                failure_mode = getattr(tool, 'failure_mode', ToolFailureMode.NON_TERMINAL)
                 if failure_mode == ToolFailureMode.TERMINAL:
                     self.logger.critical(
                         f"Tool {tool_name} has TERMINAL failure mode; aborting execution",
@@ -306,8 +355,6 @@ class TriageAgent:
                 raise
         
         # Mark tool execution phase complete
-        #, no tools to implement, put back in later: state.set_tools_complete(timestamp=self._get_timestamp())
-        
         state.add_message(f"All tools completed at {self._get_timestamp()}")
         
         self.logger.info(
@@ -413,32 +460,33 @@ class TriageAgent:
         return round(elapsed, 2)
     
     def _compute_total_execution_time(self, state: AgentState) -> float:
-    ### Compute total execution time in milliseconds.
-    
-    # Args:
-    #    state: AgentState with execution timestamps
-    
-    # Returns:
-    #    Execution time in milliseconds
-
+        """
+        Compute total execution time in milliseconds.
+        
+        Args:
+            state: AgentState with execution timestamps
+        
+        Returns:
+            Execution time in milliseconds
+        """
         start_time = state.execution_start_time
         end_time = state.get_decision_timestamp()
-    
+        
         if start_time is None or end_time is None:
             return 0.0
-    
-    # Handle both datetime objects and ISO strings
+        
+        # Handle both datetime objects and ISO strings
         if isinstance(start_time, str):
             start_dt = datetime.fromisoformat(start_time)
         else:
             start_dt = start_time
-    
+        
         if isinstance(end_time, str):
             end_dt = datetime.fromisoformat(end_time)
         else:
             end_dt = end_time
-    
-    # Compute difference in milliseconds
+        
+        # Compute difference in milliseconds
         time_diff = (end_dt - start_dt).total_seconds() * 1000
         return time_diff
     
@@ -453,8 +501,6 @@ class TriageAgent:
         Raises:
             StateValidationError: If result is invalid
         """
-        # TODO: Implement comprehensive result validation
-        # For Week 2: basic type check
         if result is None:
             raise StateValidationError(
                 f"Tool {tool_name} returned None; expected ToolResult or dict"
@@ -470,8 +516,6 @@ class TriageAgent:
         Raises:
             StateValidationError: If decision is invalid
         """
-        # TODO: Implement comprehensive decision validation
-        # For Week 2: basic existence check
         if decision is None:
             raise StateValidationError("PolicyEngine returned None decision")
         

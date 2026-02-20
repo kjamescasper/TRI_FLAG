@@ -3,23 +3,9 @@ main.py
 
 Entry point for the TRI_FLAG agentic research system.
 
-This script serves as an architectural smoke test, demonstrating that the
-core components (TriageAgent, PolicyEngine, Tools) can be wired together
-and executed end-to-end. It contains no domain logic and uses placeholder
-inputs suitable for Week 2-3 architectural validation.
-
-Usage:
-    python main.py
-
-Expected behavior:
-    - Logs system initialization
-    - Instantiates agent, policy engine, and tool registry
-    - Executes a minimal triage workflow
-    - Logs the final decision
-    - Exits cleanly
-
-Author: TRI_FLAG Research Team
-Week: 3 (Chemical Validity Checking)
+Week 3: ValidityTool registered — invalid molecules discarded early
+Week 4: SAScoreTool registered — synthetically intractable molecules
+        discarded, challenging molecules flagged and continued
 """
 
 import logging
@@ -31,100 +17,47 @@ from agent.triage_agent import TriageAgent
 from policies.policy_engine import PolicyEngine
 from tools.base_tool import Tool
 from tools.validity_tool import ValidityTool
+from tools.sa_score_tool import SAScoreTool
 
 
 def configure_logging() -> None:
-    """
-    Configure structured logging for traceability and debugging.
-    
-    Sets up INFO-level logging with timestamps, module names, and log levels
-    to enable full execution tracing for reproducibility analysis.
-    
-    Rationale:
-        - INFO level is appropriate for architectural validation
-        - Timestamps enable reproducibility analysis
-        - Module names help trace execution flow
-        - Stream handler ensures visibility in development and CI/CD
-    """
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=[logging.StreamHandler(sys.stdout)]
     )
     logging.info("Logging configured for TRI_FLAG system")
 
 
 def initialize_tools() -> List[Tool]:
     """
-    Initialize the tool registry.
-    
-    Week 3: ValidityTool is registered FIRST to ensure
-    invalid molecules are rejected before expensive computations.
-    
-    Returns:
-        List of tools in execution order
-    
-    Rationale:
-        - Explicit function makes future tool registration trivial
-        - Returning empty list validates that agent handles zero tools
-        - Type annotation ensures architectural contract is maintained
-        
-    Future usage (Week 4+):
-        tools = [
-            ValidityTool(),  # Always first
-            SAScoreTool(),
-            SimilarityTool(),
-        ]
+    Initialize the tool registry in execution order.
+
+    Order is critical:
+        1. ValidityTool  — Must be first. Invalid chemistry terminates here.
+        2. SAScoreTool   — Runs only on valid molecules.
+                          SA > 7  -> DISCARD (terminate)
+                          SA 6-7  -> FLAG (annotate, continue)
+                          SA < 6  -> PASS (continue)
+        # Week 5:
+        # 3. SimilarityTool — novelty / IP risk check
     """
     tools: List[Tool] = [
-        ValidityTool(),  # MUST be first
-        # Future tools will go here (SA Score, Similarity, etc.)
+        ValidityTool(),
+        SAScoreTool(),
     ]
-    logging.info(f"Initialized {len(tools)} tools")
+    logging.info(f"Initialized {len(tools)} tools: {[t.name for t in tools]}")
     return tools
 
 
 def initialize_policy_engine() -> PolicyEngine:
-    """
-    Initialize the policy evaluation engine.
-    
-    Returns:
-        Configured PolicyEngine instance
-    
-    Rationale:
-        - Encapsulates policy engine construction
-        - Future configuration (e.g., risk thresholds) can be added here
-        - Logging confirms successful initialization
-        - Provides clear extension point for policy customization
-    """
     policy_engine = PolicyEngine()
     logging.info("PolicyEngine initialized")
     return policy_engine
 
 
 def initialize_agent(tools: List[Tool], policy_engine: PolicyEngine) -> TriageAgent:
-    """
-    Initialize the triage agent with dependencies.
-    
-    Args:
-        tools: List of available evaluation tools
-        policy_engine: Policy evaluation engine
-    
-    Returns:
-        Configured TriageAgent instance
-    
-    Rationale:
-        - Explicit dependency injection makes testing easier
-        - Separates object construction from usage
-        - Documents required dependencies clearly
-        - Agent owns orchestration logic, not construction
-        - Logger is created specifically for the agent's use
-    """
-    # Create a logger specifically for the TriageAgent
     agent_logger = logging.getLogger("agent.triage_agent")
-    
     agent = TriageAgent(
         tools=tools,
         policy_engine=policy_engine,
@@ -135,86 +68,51 @@ def initialize_agent(tools: List[Tool], policy_engine: PolicyEngine) -> TriageAg
 
 
 def run_smoke_test(agent: TriageAgent) -> None:
-    """
-    Execute a minimal workflow to validate system wiring.
-    
-    Args:
-        agent: Configured TriageAgent instance
-    
-    Raises:
-        Any exception from agent.run() (fail-fast behavior for Week 3)
-    
-    Rationale:
-        - Uses valid SMILES for Week 3 chemistry validation
-        - Validates that agent.run() executes without exceptions
-        - Logs outcome for traceability
-        - Does not validate correctness of decision (that's a unit test concern)
-        - Exceptions propagate for visibility during development
-    """
     logging.info("=" * 60)
-    logging.info("Starting architectural smoke test")
+    logging.info("Starting Week 4 architectural smoke test")
     logging.info("=" * 60)
-    
-    # Week 3: Use valid SMILES for chemistry validation
-    molecule_id = "TEST_MOLECULE_001"
-    raw_input = "CCO"  # Ethanol - simple valid molecule
-    
-    logging.info(f"Running triage for molecule_id='{molecule_id}'")
-    
-    # Execute the full pipeline
-    # Note: We allow exceptions to propagate (fail-fast for Week 3)
-    decision = agent.run(molecule_id=molecule_id, raw_input=raw_input)
-    
-    # Log the outcome using Decision.__str__() implementation
-    logging.info(f"Triage completed. Decision: {decision}")
+
+    test_cases = [
+        ("TEST_EASY_001",    "CCO",                             "Ethanol — expect PASS"),
+        ("TEST_MEDIUM_001",  "CC(=O)Oc1ccccc1C(=O)O",          "Aspirin — expect PASS"),
+        ("TEST_INVALID_001", "C(C)(C)(C)(C)C",                  "Invalid valence — expect DISCARD"),
+        ("TEST_COMPLEX_001",
+         "CC(C)CCCC(C)C1CCC2C1(CCC3C2CC=C4C3(CCC(C4)O)C)C",
+         "Cholesterol — may FLAG or DISCARD"),
+    ]
+
+    for molecule_id, smiles, description in test_cases:
+        logging.info(f"\n  --- {description} ---")
+        state = agent.run(molecule_id=molecule_id, raw_input=smiles)
+
+        decision = state.decision
+        sa_result = state.tool_results.get("SAScoreTool")
+
+        logging.info(f"  Decision: {decision}")
+        if sa_result and isinstance(sa_result, dict) and sa_result.get("sa_score"):
+            logging.info(
+                f"  SA Score: {sa_result['sa_score']:.2f} "
+                f"({sa_result.get('synthesizability_category', '?')})"
+            )
+        if state.is_flagged():
+            logging.info(f"  Flags: {state.get_flags()}")
+        if state.is_terminated():
+            logging.info(f"  Terminated: {state.get_termination_reason()}")
+
     logging.info("=" * 60)
     logging.info("Smoke test PASSED")
     logging.info("=" * 60)
 
 
 def main() -> None:
-    """
-    Main entry point for TRI_FLAG system.
-    
-    Orchestrates:
-        1. Logging configuration
-        2. Component initialization (tools, policy engine, agent)
-        3. Smoke test execution
-        4. Clean exit
-    
-    This function remains minimal and focused on orchestration.
-    All domain logic belongs in agent, tools, or policy modules.
-    
-    Error handling:
-        - Exceptions propagate to caller (fail-fast for Week 3)
-        - Full stack traces visible for debugging
-        - No graceful degradation at this stage
-    """
-    # Step 1: Configure logging first for visibility
     configure_logging()
-    
-    # Step 2: Initialize components in dependency order
     logging.info("Initializing TRI_FLAG components...")
     tools = initialize_tools()
     policy_engine = initialize_policy_engine()
     agent = initialize_agent(tools=tools, policy_engine=policy_engine)
-    
-    # Step 3: Execute smoke test
     run_smoke_test(agent)
-    
-    # Step 4: Clean exit
     logging.info("TRI_FLAG system execution complete")
 
 
 if __name__ == "__main__":
-    """
-    Module guard ensures main() only runs when executed directly.
-    
-    This allows main.py to be imported without side effects,
-    which is essential for:
-        - Testing frameworks (pytest can import without execution)
-        - Interactive debugging (import in REPL)
-        - Documentation generation tools
-        - Future CLI wrappers
-    """
     main()

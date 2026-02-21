@@ -5,6 +5,9 @@ TRI_FLAG Policy Engine — governs triage routing decisions.
 
 Week 3: Chemical validity check -> DISCARD if invalid
 Week 4: SA score check -> DISCARD if SA > 7, FLAG if 6-7 (continues), PASS if < 6
+         Added PolicyDecision, should_discard(), should_flag(), sa_thresholds param
+Week 5: Similarity/IP-risk check -> FLAG on Tanimoto >= 0.85 (never DISCARD)
+         Dual-source ChEMBL + PubChem reporting; escalation for Tanimoto >= 0.95
 
 ARCHITECTURE NOTE
 -----------------
@@ -12,7 +15,7 @@ The existing triage_agent.py calls policy_engine.evaluate(state) and expects
 a Decision object (from agent/decision.py) in return. This file preserves that
 contract exactly — evaluate() signature and return type are unchanged from Week 3.
 
-Internally, routing logic is handled by the new PolicyDecision class for
+Internally, routing logic is handled by the PolicyDecision class (Week 4) for
 clarity, but evaluate() always converts to a Decision before returning.
 """
 
@@ -30,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Policy Protocol -- preserved from Week 3 (required by policies/__init__.py)
+# Policy Protocol -- preserved from Week 3
 # ---------------------------------------------------------------------------
 
 class Policy(Protocol):
@@ -46,7 +49,7 @@ class Policy(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# PolicyDecision: internal routing result (Week 4 addition)
+# PolicyDecision: internal routing result (Week 4, preserved exactly)
 # ---------------------------------------------------------------------------
 
 class PolicyDecision:
@@ -127,12 +130,13 @@ class PolicyEngine:
     Evaluates tool results in AgentState and returns a Decision.
 
     Decision priority (checked in order):
-        1. ValidityTool  -- DISCARD if chemistry is invalid (Week 3)
-        2. SAScoreTool   -- DISCARD if SA > flag_threshold (Week 4)
-                         -- FLAG    if pass_threshold <= SA <= flag_threshold
-                         -- PASS    if SA < pass_threshold
-        3. Legacy pluggable policies (Week 3 design, still supported)
-        4. Default fallback -- FLAG (conservative, no decisive result found)
+        1. ValidityTool    -- DISCARD if chemistry is invalid (Week 3)
+        2. SAScoreTool     -- DISCARD if SA > flag_threshold (Week 4)
+                           -- FLAG    if pass_threshold <= SA <= flag_threshold
+                           -- PASS    if SA < pass_threshold
+        3. SimilarityTool  -- FLAG on Tanimoto >= 0.85 (Week 5, never DISCARD)
+        4. Legacy pluggable policies (Week 3 design, still supported)
+        5. Default fallback -- FLAG (conservative, no decisive result found)
 
     Returns a Decision object (from agent/decision.py). Interface is unchanged
     from Week 3 -- evaluate() signature and return type are identical.
@@ -151,9 +155,10 @@ class PolicyEngine:
         self.sa_thresholds = sa_thresholds or DEFAULT_SA_THRESHOLDS
 
         logger.info(
-            "PolicyEngine initialised -- %d policies, "
+            "PolicyEngine initialized: %d pluggable policies, default=%s, "
             "SA thresholds: pass=%.1f flag=%.1f",
             len(self.policies),
+            default_action.name,
             self.sa_thresholds.pass_threshold,
             self.sa_thresholds.flag_threshold,
         )
@@ -168,15 +173,6 @@ class PolicyEngine:
 
         Checks in priority order. Returns the first decisive result,
         or the default fallback if nothing is decisive.
-
-        Args:
-            state: AgentState populated with tool results.
-
-        Returns:
-            Decision object (PASS / FLAG / DISCARD) with rationale.
-
-        Raises:
-            ValueError: If state is None or missing required attributes.
         """
         self._validate_state(state)
 
@@ -189,8 +185,21 @@ class PolicyEngine:
         # -- Week 4: SA score check --------------------------------------
         pd = self._check_sa_score(state)
         if pd is not None:
-            self._log_provenance(state, pd)
-            return pd.to_decision()
+            if pd.decision == "DISCARD":
+                self._log_provenance(state, pd)
+                return pd.to_decision()
+            accumulated_flag_pd = pd
+        else:
+            accumulated_flag_pd = None
+
+        # -- Week 5: Similarity / IP risk check --------------------------
+        sim_pd = self._check_similarity(state)
+        if sim_pd is not None:
+            if accumulated_flag_pd is not None:
+                combined = self._compose_flags(accumulated_flag_pd, sim_pd, state)
+                self._log_provenance(state, combined)
+                return combined.to_decision()
+            accumulated_flag_pd = sim_pd
 
         # -- Legacy pluggable policies (Week 3 design) -------------------
         for idx, policy in enumerate(self.policies):
@@ -205,6 +214,11 @@ class PolicyEngine:
                 )
                 self._log_decision_provenance(state, decision, policy)
                 return decision
+
+        # -- Return accumulated FLAG if any ------------------------------
+        if accumulated_flag_pd is not None:
+            self._log_provenance(state, accumulated_flag_pd)
+            return accumulated_flag_pd.to_decision()
 
         # -- Default fallback --------------------------------------------
         logger.warning(
@@ -242,25 +256,17 @@ class PolicyEngine:
         if validity_result is None:
             return None
 
-        # Handle ToolResult dataclass wrapper if present
         if hasattr(validity_result, 'data'):
             validity_result = validity_result.data or {}
 
-        # Default False matches Week 3 exactly: missing key treated as invalid
         if not validity_result.get('is_valid', False):
             error_msg = validity_result.get('error_message', 'Unknown validation error')
-            logger.warning(
-                "[%s] Policy DISCARD: invalid chemistry -- %s",
-                state.molecule_id, error_msg,
-            )
+            logger.warning("[%s] Policy DISCARD: invalid chemistry -- %s", state.molecule_id, error_msg)
             return PolicyDecision(
                 decision="DISCARD",
                 reason=f"Chemically invalid molecule: {error_msg}",
                 tool_checked="ValidityTool",
-                metadata={
-                    'termination_reason': 'validity_check_failed',
-                    'validity_error': error_msg,
-                },
+                metadata={'termination_reason': 'validity_check_failed', 'validity_error': error_msg},
             )
         return None
 
@@ -273,17 +279,12 @@ class PolicyEngine:
         if sa_result is None:
             return None
 
-        # Handle ToolResult dataclass wrapper if present
         if hasattr(sa_result, 'data'):
             sa_result = sa_result.data or {}
 
-        # Tool-level error
         if sa_result.get('sa_decision') == 'ERROR':
             error = sa_result.get('error_message', 'Unknown SA score error')
-            logger.error(
-                "[%s] Policy ERROR: SAScoreTool failed -- %s",
-                state.molecule_id, error,
-            )
+            logger.error("[%s] Policy ERROR: SAScoreTool failed -- %s", state.molecule_id, error)
             return PolicyDecision(
                 decision="ERROR",
                 reason=f"SAScoreTool error: {error}",
@@ -300,49 +301,128 @@ class PolicyEngine:
         description = sa_result.get('sa_description', f'SA score {sa_score:.2f}')
         warning_flags = sa_result.get('warning_flags', [])
 
-        metadata = {
-            'sa_score': sa_score,
-            'synthesizability_category': category,
-            'warning_flags': warning_flags,
-        }
+        metadata = {'sa_score': sa_score, 'synthesizability_category': category, 'warning_flags': warning_flags}
 
         if tool_decision == 'DISCARD':
-            logger.warning(
-                "[%s] Policy DISCARD: SA=%.2f (%s) > %.1f",
-                state.molecule_id, sa_score, category,
-                self.sa_thresholds.flag_threshold,
-            )
-            return PolicyDecision(
-                decision="DISCARD",
-                reason=description,
-                tool_checked="SAScoreTool",
-                metadata=metadata,
-            )
+            logger.warning("[%s] Policy DISCARD: SA=%.2f (%s)", state.molecule_id, sa_score, category)
+            return PolicyDecision(decision="DISCARD", reason=description, tool_checked="SAScoreTool", metadata=metadata)
 
         if tool_decision == 'FLAG':
-            logger.warning(
-                "[%s] Policy FLAG: SA=%.2f (%s) in [%.1f, %.1f] -- continuing",
-                state.molecule_id, sa_score, category,
-                self.sa_thresholds.pass_threshold,
-                self.sa_thresholds.flag_threshold,
-            )
+            logger.warning("[%s] Policy FLAG: SA=%.2f (%s) -- continuing", state.molecule_id, sa_score, category)
+            return PolicyDecision(decision="FLAG", reason=description, tool_checked="SAScoreTool", metadata=metadata)
+
+        return PolicyDecision(decision="PASS", reason=description, tool_checked="SAScoreTool", metadata=metadata)
+
+    # ------------------------------------------------------------------
+    # Week 5: Similarity / IP-risk check
+    # ------------------------------------------------------------------
+
+    def _check_similarity(self, state: AgentState) -> Optional[PolicyDecision]:
+        sim_result = state.tool_results.get("SimilarityTool")
+        if sim_result is None:
+            return None
+
+        decision_str = sim_result.get("similarity_decision", "PASS")
+        nn_tanimoto = sim_result.get("nearest_neighbor_tanimoto", 0.0)
+        nn_source = sim_result.get("nearest_neighbor_source")
+        nn_id = sim_result.get("nearest_neighbor_id")
+        nn_name = sim_result.get("nearest_neighbor_name")
+        chembl_hits = sim_result.get("chembl_hits", [])
+        pubchem_hits = sim_result.get("pubchem_hits", [])
+        threshold_used = sim_result.get("flag_threshold_used", 0.85)
+        apis_queried = sim_result.get("apis_queried", [])
+
+        if decision_str == "PASS":
+            return None
+
+        if decision_str == "ERROR":
             return PolicyDecision(
                 decision="FLAG",
-                reason=description,
-                tool_checked="SAScoreTool",
-                metadata=metadata,
+                reason=(
+                    "Similarity screening could not complete (both ChEMBL and "
+                    "PubChem APIs unavailable). IP risk unknown — flagging for manual review."
+                ),
+                tool_checked="SimilarityTool",
+                metadata={"similarity_decision": "ERROR", "error_reason": sim_result.get("error_reason", "API unavailable")},
             )
 
-        # PASS
+        rationale = self._build_similarity_rationale(
+            nn_tanimoto=nn_tanimoto, nn_source=nn_source, nn_id=nn_id, nn_name=nn_name,
+            chembl_hits=chembl_hits, pubchem_hits=pubchem_hits,
+            threshold_used=threshold_used, apis_queried=apis_queried,
+        )
+
+        metadata: Dict[str, Any] = {
+            "nearest_neighbor_tanimoto": nn_tanimoto,
+            "nearest_neighbor_source": nn_source,
+            "nearest_neighbor_id": nn_id,
+            "nearest_neighbor_name": nn_name,
+            "flag_threshold_used": threshold_used,
+            "chembl_hits_count": len(chembl_hits),
+            "pubchem_hits_count": len(pubchem_hits),
+            "apis_queried": apis_queried,
+        }
+
+        if chembl_hits:
+            best = max(chembl_hits, key=lambda h: h.get("tanimoto", 0.0))
+            metadata["chembl_best_tanimoto"] = best.get("tanimoto", 0.0)
+            metadata["chembl_best_id"] = best.get("id")
+
+        if pubchem_hits:
+            best = max(pubchem_hits, key=lambda h: h.get("tanimoto", 0.0))
+            metadata["pubchem_best_tanimoto"] = best.get("tanimoto", 0.0)
+            metadata["pubchem_best_id"] = best.get("id")
+
+        if nn_tanimoto >= 0.95:
+            metadata["escalated"] = True
+
+        return PolicyDecision(decision="FLAG", reason=rationale, tool_checked="SimilarityTool", metadata=metadata)
+
+    def _build_similarity_rationale(
+        self, nn_tanimoto, nn_source, nn_id, nn_name,
+        chembl_hits, pubchem_hits, threshold_used, apis_queried,
+    ) -> str:
+        nn_label = nn_name or nn_id or "unknown compound"
+        if nn_tanimoto >= 0.95:
+            severity = "near-identical"
+            advice = "Priority IP review required — this may be an enantiomer, prodrug, or salt form of an existing drug or patent."
+        else:
+            severity = "highly similar"
+            advice = "IP review recommended — possible same scaffold as known compound."
+
+        parts = [
+            f"Similarity screening flagged molecule as {severity} to known compounds (Tanimoto {nn_tanimoto:.3f} >= {threshold_used:.2f} threshold).",
+            f"Nearest neighbor: {nn_label} [{nn_source}, {nn_id}].",
+        ]
+
+        if chembl_hits and pubchem_hits:
+            bc = max(chembl_hits, key=lambda h: h.get("tanimoto", 0.0))
+            bp = max(pubchem_hits, key=lambda h: h.get("tanimoto", 0.0))
+            parts.append(f"Dual-source confirmation: ChEMBL best={bc.get('tanimoto',0.0):.3f} ({bc.get('id','?')}), PubChem best={bp.get('tanimoto',0.0):.3f} ({bp.get('id','?')}).")
+        elif chembl_hits:
+            parts.append(f"Source: ChEMBL ({len(chembl_hits)} hits above threshold).")
+        elif pubchem_hits:
+            parts.append(f"Source: PubChem ({len(pubchem_hits)} hits above threshold).")
+
+        parts.append(advice)
+        return " ".join(parts)
+
+    def _compose_flags(self, sa_pd: PolicyDecision, sim_pd: PolicyDecision, state: AgentState) -> PolicyDecision:
+        combined_reason = (
+            f"Multiple concerns flagged for {state.identifier}. "
+            f"(1) Synthetic accessibility: {sa_pd.reason} "
+            f"(2) IP similarity: {sim_pd.reason}"
+        )
+        logger.info("Composed dual FLAG for %s: SA + Similarity", state.identifier)
         return PolicyDecision(
-            decision="PASS",
-            reason=description,
-            tool_checked="SAScoreTool",
-            metadata=metadata,
+            decision="FLAG",
+            reason=combined_reason,
+            tool_checked="SAScoreTool+SimilarityTool",
+            metadata={"flag_sources": ["SAScoreTool", "SimilarityTool"], "sa_flag_metadata": sa_pd.metadata, "similarity_flag_metadata": sim_pd.metadata},
         )
 
     # ------------------------------------------------------------------
-    # Helpers (preserved from Week 3, extended)
+    # Helpers
     # ------------------------------------------------------------------
 
     def _validate_state(self, state: AgentState) -> None:
@@ -352,10 +432,7 @@ class PolicyEngine:
             raise ValueError("AgentState must contain a valid identifier")
         if not hasattr(state, 'tool_results'):
             raise ValueError("AgentState must contain tool_results attribute")
-        logger.debug(
-            "State validation passed: %s, %d tool results",
-            state.identifier, len(state.tool_results)
-        )
+        logger.debug("State validation passed: %s, %d tool results", state.identifier, len(state.tool_results))
 
     def _create_fallback_decision(self, state: AgentState) -> Decision:
         rationale = (
@@ -366,33 +443,23 @@ class PolicyEngine:
         return Decision(
             decision_type=self.default_action,
             rationale=rationale,
-            metadata={
-                "decision_type": "fallback",
-                "num_policies_evaluated": len(self.policies),
-                "tool_results_count": len(state.tool_results),
-            },
+            metadata={"decision_type": "fallback", "num_policies_evaluated": len(self.policies), "tool_results_count": len(state.tool_results)},
         )
 
     def _log_provenance(self, state: AgentState, pd: PolicyDecision) -> None:
         logger.info(
-            "Decision provenance: identifier=%s decision=%s tool=%s",
-            state.identifier, pd.decision, pd.tool_checked,
+            "Decision provenance: identifier=%s, action=%s, source=%s, tool_results=%s",
+            state.identifier, pd.decision, pd.tool_checked, list(state.tool_results.keys()),
         )
 
-    def _log_decision_provenance(
-        self,
-        state: AgentState,
-        decision: Decision,
-        policy: Optional[Policy],
-    ) -> None:
-        provenance = {
+    def _log_decision_provenance(self, state: AgentState, decision: Decision, policy: Optional[Policy]) -> None:
+        logger.info("Decision provenance: %s", {
             "identifier": state.identifier,
             "decision_action": decision.decision_type.name,
             "policy": policy.__class__.__name__ if policy else "fallback",
             "num_tool_results": len(state.tool_results),
             "tool_names": list(state.tool_results.keys()),
-        }
-        logger.info("Decision provenance: %s", provenance)
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -400,14 +467,8 @@ class PolicyEngine:
 # ---------------------------------------------------------------------------
 
 class PlaceholderPolicy:
-    """
-    Placeholder policy demonstrating the pluggable policy interface.
-    Always returns None (non-decisive). Preserved from Week 3.
-    """
+    """Placeholder policy, always non-decisive. Preserved from Week 3."""
 
     def evaluate(self, state: AgentState) -> Optional[Decision]:
-        logger.debug(
-            "PlaceholderPolicy evaluated (non-decisive) for %s",
-            state.identifier
-        )
+        logger.debug("PlaceholderPolicy: non-decisive for %s", state.identifier)
         return None

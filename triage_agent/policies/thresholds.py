@@ -51,16 +51,6 @@ PipelineDecision = str  # "PASS" | "FLAG" | "DISCARD"
 # =============================================================================
 # System 1: Descriptive Categorization (4-tier)
 # =============================================================================
-#
-# Based on Ertl & Schuffenhauer [1] and validated by Gao & Coley [3]:
-#
-#   easy          SA ≤ 3.0 — Simple, commercially available building blocks.
-#                            Aspirin = ~1.7, Ibuprofen = ~2.1 [1]
-#   moderate      SA ≤ 6.0 — Typical drug candidates. Most marketed small
-#                            molecules fall in the 2-5 range [2].
-#   difficult     SA ≤ 7.0 — Natural product-like. Specialist synthesis needed.
-#   very_difficult SA > 7.0 — Rarely synthesised; generative model outputs at
-#                            this score are typically infeasible [3].
 
 class SAScoreCategoryThresholds:
     """
@@ -102,19 +92,6 @@ class SAScoreCategoryThresholds:
 # =============================================================================
 # System 2: Pipeline Decision Thresholds (3-tier)
 # =============================================================================
-#
-#   PASS    SA < pass_threshold (6.0)
-#           Straightforward synthesis; proceed to next filter.
-#           Rationale: ~95% of known drugs score ≤ 6 [1].
-#
-#   FLAG    pass_threshold ≤ SA ≤ flag_threshold (6.0–7.0)
-#           Challenging but feasible; log warning, continue pipeline.
-#           Rationale: borderline cases benefit from human review [2].
-#
-#   DISCARD SA > flag_threshold (7.0)
-#           Synthetically intractable for drug development.
-#           Rationale: SA > 7 strongly predicts infeasibility in
-#           generative model outputs [3].
 
 class SAScoreThresholds:
     """
@@ -142,7 +119,6 @@ class SAScoreThresholds:
         self.flag_threshold = flag_threshold
         self.score_min = score_min
         self.score_max = score_max
-        # Allow custom category thresholds; default aligns with pipeline thresholds
         self._category = category_thresholds or SAScoreCategoryThresholds()
 
     def classify(self, sa_score: float) -> PipelineDecision:
@@ -201,10 +177,6 @@ DEFAULT_SA_THRESHOLDS = SAScoreThresholds(
     pass_threshold=6.0,
     flag_threshold=7.0,
 )
-"""
-Standard thresholds for general drug discovery triage.
-Suitable for hit identification and hit-to-lead campaigns.
-"""
 
 LEAD_OPTIMIZATION_THRESHOLDS = SAScoreThresholds(
     pass_threshold=5.0,
@@ -213,11 +185,6 @@ LEAD_OPTIMIZATION_THRESHOLDS = SAScoreThresholds(
         easy_max=2.5, moderate_max=5.0, difficult_max=6.0
     ),
 )
-"""
-Stricter thresholds for lead optimization.
-At this stage each analog must be readily synthesisable by a medicinal
-chemistry team. Lead compounds should ideally score < 4 [2].
-"""
 
 NATURAL_PRODUCT_THRESHOLDS = SAScoreThresholds(
     pass_threshold=7.0,
@@ -226,11 +193,6 @@ NATURAL_PRODUCT_THRESHOLDS = SAScoreThresholds(
         easy_max=4.0, moderate_max=7.0, difficult_max=9.0
     ),
 )
-"""
-Permissive thresholds for natural product-inspired campaigns.
-Natural products routinely score 6-9; standard thresholds would
-incorrectly discard most of the relevant chemical space.
-"""
 
 FRAGMENT_SCREENING_THRESHOLDS = SAScoreThresholds(
     pass_threshold=3.5,
@@ -239,11 +201,6 @@ FRAGMENT_SCREENING_THRESHOLDS = SAScoreThresholds(
         easy_max=2.0, moderate_max=3.5, difficult_max=5.0
     ),
 )
-"""
-Very strict thresholds for fragment-based drug discovery.
-Fragment libraries contain only the simplest building blocks (SA < 3)
-to allow rapid elaboration.
-"""
 
 
 # =============================================================================
@@ -251,11 +208,81 @@ to allow rapid elaboration.
 # =============================================================================
 
 VALIDITY_MIN_ATOMS: int = 1
-"""Minimum heavy atom count for a molecule to be considered valid."""
-
 VALIDITY_MAX_ATOMS: int = 500
-"""
-Maximum heavy atom count before flagging as anomalously large.
-Typical drug-like molecules have 20-70 heavy atoms. 500 is a generous
-ceiling to catch degenerate generative model outputs.
-"""
+
+
+# =============================================================================
+# Week 5: Similarity / IP-Risk Thresholds
+# =============================================================================
+
+from dataclasses import dataclass
+
+
+@dataclass
+class SimilarityThresholds:
+    """
+    Tanimoto similarity thresholds for IP-risk screening via API-based search.
+
+    SimilarityTool queries ChEMBL and PubChem; molecules with nearest-neighbor
+    Tanimoto >= flag_threshold are flagged for IP review. Only FLAG is produced
+    — never DISCARD. Similarity is a proxy signal, not a legal determination.
+
+    Attributes:
+        flag_threshold:       Tanimoto >= this value → FLAG (default 0.85)
+        escalation_threshold: Tanimoto >= this value → escalated FLAG with
+                              "near-identical" language (default 0.95)
+
+    Literature:
+        ECFP4 Tanimoto > 0.85 ≈ same scaffold (Maggiora et al., 2014,
+        J. Med. Chem. 57, 3186-3204).
+    """
+    flag_threshold: float = 0.85
+    escalation_threshold: float = 0.95
+
+    def __post_init__(self):
+        if not (0.0 < self.flag_threshold <= 1.0):
+            raise ValueError(
+                f"flag_threshold must be in (0, 1], got {self.flag_threshold}"
+            )
+        if not (0.0 < self.escalation_threshold <= 1.0):
+            raise ValueError(
+                f"escalation_threshold must be in (0, 1], got {self.escalation_threshold}"
+            )
+        if self.flag_threshold > self.escalation_threshold:
+            raise ValueError(
+                f"flag_threshold ({self.flag_threshold}) must be <= "
+                f"escalation_threshold ({self.escalation_threshold})"
+            )
+
+    def classify(self, tanimoto: float) -> str:
+        """Return 'PASS' or 'FLAG' for a given Tanimoto score."""
+        return "FLAG" if tanimoto >= self.flag_threshold else "PASS"
+
+    def is_escalated(self, tanimoto: float) -> bool:
+        """Return True if score meets escalation threshold (near-identical)."""
+        return tanimoto >= self.escalation_threshold
+
+    def describe(self, tanimoto: float) -> str:
+        """Return human-readable description of the similarity classification."""
+        if self.is_escalated(tanimoto):
+            return (
+                f"FLAG (escalated): Tanimoto {tanimoto:.3f} >= {self.escalation_threshold:.2f} "
+                f"— near-identical to known compound. Priority IP review required."
+            )
+        elif self.classify(tanimoto) == "FLAG":
+            return (
+                f"FLAG: Tanimoto {tanimoto:.3f} >= {self.flag_threshold:.2f} "
+                f"— highly similar to known compound. IP review recommended."
+            )
+        else:
+            return (
+                f"PASS: Tanimoto {tanimoto:.3f} < {self.flag_threshold:.2f} "
+                f"— dissimilar to known compounds. No IP concern detected."
+            )
+
+
+DEFAULT_SIMILARITY_THRESHOLDS = SimilarityThresholds(
+    flag_threshold=0.85,
+    escalation_threshold=0.95,
+)
+"""Default similarity thresholds for general drug discovery IP screening."""

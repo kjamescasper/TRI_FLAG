@@ -1,37 +1,55 @@
 """
 main.py
 
-Entry point for the TRI_FLAG agentic research system.
+TRI_FLAG — Command-Line Entry Point (Week 6)
 
-This script serves as an architectural smoke test, demonstrating that the
-core components (TriageAgent, PolicyEngine, Tools) can be wired together
-and executed end-to-end.
+Week 3-5: Smoke-test entry point (single hardcoded molecule).
+Week 6:   Full CLI with argparse. Accepts single SMILES or batch CSV.
+          Builds flat rationale explanation and saves run records to JSONL.
 
 Usage:
+    # Single molecule
+    python main.py --smiles "CCO" --id ethanol_001
+
+    # Batch from CSV (columns: molecule_id, smiles[, name])
+    python main.py --input molecules.csv
+
+    # Custom output file
+    python main.py --smiles "CCO" --output runs/my_runs.jsonl
+
+    # Skip similarity search (fast offline mode)
+    python main.py --smiles "CCO" --no-similarity
+
+    # Suppress log noise, print only the report
+    python main.py --smiles "CCO" --quiet
+
+    # Smoke test (Week 3-5 behaviour, no args needed)
     python main.py
 
-Expected behavior:
-    - Logs system initialization
-    - Instantiates agent, policy engine, and tool registry
-    - Executes a minimal triage workflow (ethanol, CCO)
-    - Logs the final decision
-    - Exits cleanly
-
-Performance note (Week 5):
-    With SimilarityTool registered, `python main.py` takes ~3-8 seconds
-    due to live ChEMBL and PubChem API round trips. This is expected — the
-    trade-off for live database coverage. For offline testing, use the
-    unit test suite which mocks all network calls.
+Expected output (single molecule):
+    ══════════════════════════════════════════════════════════
+      TRI_FLAG TRIAGE REPORT
+    ══════════════════════════════════════════════════════════
+      Molecule  : ethanol_001
+      SMILES    : CCO
+      Decision  : FLAG
+      Summary   : ethanol_001 was flagged for IP review ...
+    ...
 
 Author: TRI_FLAG Research Team
-Week: 5 (Similarity / IP-Risk Screening)
+Week: 6 (Policy engine, rationale, run records)
 """
 
+from __future__ import annotations
+
+import argparse
+import csv
 import logging
 import sys
-from typing import List
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-from agent.agent_state import AgentState
+# ── Core pipeline imports ────────────────────────────────────────────────────
 from agent.triage_agent import TriageAgent
 from policies.policy_engine import PolicyEngine
 from tools.base_tool import Tool
@@ -39,153 +57,379 @@ from tools.validity_tool import ValidityTool
 from tools.sa_score_tool import SAScoreTool
 from tools.similarity_tool import SimilarityTool
 
+# ── Week 6: reporting layer ──────────────────────────────────────────────────
+from reporting.rationale_builder import RationaleBuilder, format_text
+from reporting.run_record import RunRecordBuilder, save as save_record
 
-def configure_logging() -> None:
+logger = logging.getLogger(__name__)
+
+# Default output path — can be overridden via --output
+DEFAULT_OUTPUT = Path("runs") / "triage_runs.jsonl"
+
+
+# ============================================================================
+# Initialisation helpers (unchanged from Week 5 smoke test, extracted cleanly)
+# ============================================================================
+
+def initialize_tools(*, use_similarity: bool = True) -> List[Tool]:
     """
-    Configure structured logging for traceability and debugging.
+    Initialise the tool registry in required execution order.
 
-    Sets up INFO-level logging with timestamps, module names, and log levels
-    to enable full execution tracing for reproducibility analysis.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logging.info("Logging configured for TRI_FLAG system")
-
-
-def initialize_tools() -> List[Tool]:
-    """
-    Initialize the tool registry in execution order.
-
-    Tool order (enforced):
-        1. ValidityTool    — Week 3: invalid molecules exit immediately
-        2. SAScoreTool     — Week 4: SA > 7 exits immediately; SA 6-7 → FLAG
-        3. SimilarityTool  — Week 5: Tanimoto >= 0.85 → FLAG (never exits early)
-
-    Performance note:
-        SimilarityTool adds ~3-8s to main.py due to live API calls.
-        Unit tests use mocked network calls and run in <1s.
+    Args:
+        use_similarity: If False, SimilarityTool is omitted. Useful for fast
+                        offline runs where IP screening is not needed.
 
     Returns:
-        Ordered list of tools
+        Ordered list of tools.
     """
     tools: List[Tool] = [
-        ValidityTool(),      # MUST be first — rejects invalid chemistry
-        SAScoreTool(),       # MUST be second — rejects un-synthesizable molecules
-        SimilarityTool(),    # Week 5: IP-risk screening via ChEMBL + PubChem
-        # Future tools will go here (ADMET, selectivity, etc.)
+        ValidityTool(),
+        SAScoreTool(),
     ]
-    logging.info("Initialized %d tools: %s", len(tools), [t.name for t in tools])
+    if use_similarity:
+        tools.append(SimilarityTool())
+    else:
+        logger.info("SimilarityTool disabled (--no-similarity flag set).")
+
+    logger.info(
+        "Tools initialised (%d): %s",
+        len(tools), [t.name for t in tools],
+    )
     return tools
 
 
 def initialize_policy_engine() -> PolicyEngine:
-    """
-    Initialize the policy evaluation engine.
-
-    Returns:
-        Configured PolicyEngine instance
-    """
-    policy_engine = PolicyEngine()
-    logging.info("PolicyEngine initialized")
-    return policy_engine
+    """Initialise PolicyEngine with default thresholds."""
+    return PolicyEngine()
 
 
-def initialize_agent(
-    tools: List[Tool], policy_engine: PolicyEngine
-) -> TriageAgent:
-    """
-    Initialize the triage agent with dependencies.
-
-    Args:
-        tools: Ordered list of available evaluation tools
-        policy_engine: Policy evaluation engine
-
-    Returns:
-        Configured TriageAgent instance
-    """
+def initialize_agent(tools: List[Tool], policy_engine: PolicyEngine) -> TriageAgent:
+    """Wire tools and policy engine into a TriageAgent."""
     agent_logger = logging.getLogger("agent.triage_agent")
-    agent = TriageAgent(
-        tools=tools,
-        policy_engine=policy_engine,
-        logger=agent_logger,
-    )
-    logging.info("TriageAgent initialized with %d tools", len(tools))
-    return agent
+    return TriageAgent(tools=tools, policy_engine=policy_engine, logger=agent_logger)
 
 
-def run_smoke_test(agent: TriageAgent) -> None:
+# ============================================================================
+# Single-molecule triage
+# ============================================================================
+
+def triage_molecule(
+    agent: TriageAgent,
+    smiles: str,
+    molecule_id: str,
+    output_path: Path,
+    *,
+    quiet: bool = False,
+) -> bool:
     """
-    Execute a minimal workflow to validate system wiring.
-
-    Week 5: Ethanol (CCO) is used because it is:
-        - Chemically valid (passes ValidityTool)
-        - Trivially synthesizable (SA ≈ 1.0, passes SAScoreTool)
-        - Well-known in ChEMBL/PubChem (likely similar results from APIs)
-
-    Note on expected output:
-        Ethanol is a widely registered compound; SimilarityTool may FLAG it
-        due to high Tanimoto similarity against simple alcohols in ChEMBL.
-        This is expected behavior — the FLAG confirms API connectivity and
-        correct threshold application.
+    Run one molecule through the full pipeline, print the report, save the record.
 
     Args:
-        agent: Configured TriageAgent instance
+        agent:       Initialised TriageAgent.
+        smiles:      SMILES string to triage.
+        molecule_id: Identifier for this molecule.
+        output_path: JSONL file to append the RunRecord to.
+        quiet:       If True, suppress the text report (record still saved).
+
+    Returns:
+        True on success, False if an unrecoverable error occurred.
+    """
+    logger.info("Triaging molecule: %s (%s)", molecule_id, smiles)
+
+    try:
+        state = agent.run(molecule_id=molecule_id, raw_input=smiles)
+    except Exception as exc:
+        logger.error("Pipeline error for %s: %s", molecule_id, exc)
+        return False
+
+    # Build flat explanation
+    rationale_builder = RationaleBuilder()
+    explanation = rationale_builder.build(state)
+
+    # Print report unless --quiet
+    if not quiet:
+        print(format_text(explanation))
+
+    # Build and save run record
+    record_builder = RunRecordBuilder()
+    record = record_builder.build(state, explanation)
+
+    try:
+        save_record(record, output_path)
+        logger.info(
+            "Run record saved: %s → %s (decision: %s)",
+            molecule_id, output_path, record.final_decision,
+        )
+    except IOError as exc:
+        logger.error("Failed to save run record for %s: %s", molecule_id, exc)
+        # Non-fatal: triage succeeded, persistence failed
+        return False
+
+    return True
+
+
+# ============================================================================
+# Batch processing
+# ============================================================================
+
+def load_molecules_from_csv(csv_path: Path) -> List[Tuple[str, str]]:
+    """
+    Load (molecule_id, smiles) pairs from a CSV file.
+
+    Expected columns: molecule_id, smiles
+    Optional column:  name (ignored for now, preserved for future use)
+
+    Args:
+        csv_path: Path to the input CSV.
+
+    Returns:
+        List of (molecule_id, smiles) tuples.
 
     Raises:
-        Any exception from agent.run() (fail-fast behavior)
+        SystemExit: If the file cannot be read or required columns are missing.
     """
-    logging.info("=" * 60)
-    logging.info("Starting architectural smoke test (Week 5)")
-    logging.info("=" * 60)
+    if not csv_path.exists():
+        logger.error("Input CSV not found: %s", csv_path)
+        sys.exit(1)
 
-    molecule_id = "TEST_MOLECULE_001"
-    raw_input = "CCO"  # Ethanol — simple valid molecule with known DB entries
+    molecules: List[Tuple[str, str]] = []
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            headers = reader.fieldnames or []
 
-    logging.info(
-        "Running triage for molecule_id='%s' (SMILES: %s)",
-        molecule_id,
-        raw_input,
+            if "smiles" not in headers:
+                logger.error(
+                    "CSV missing required 'smiles' column. Found: %s", headers
+                )
+                sys.exit(1)
+
+            has_id = "molecule_id" in headers
+
+            for i, row in enumerate(reader, start=1):
+                smiles = row.get("smiles", "").strip()
+                if not smiles:
+                    logger.warning("Row %d: empty SMILES — skipping.", i)
+                    continue
+                mol_id = (
+                    row.get("molecule_id", "").strip()
+                    if has_id else f"mol_{i:04d}"
+                )
+                if not mol_id:
+                    mol_id = f"mol_{i:04d}"
+                molecules.append((mol_id, smiles))
+
+    except (IOError, csv.Error) as exc:
+        logger.error("Failed to read CSV %s: %s", csv_path, exc)
+        sys.exit(1)
+
+    logger.info("Loaded %d molecules from %s", len(molecules), csv_path)
+    return molecules
+
+
+def run_batch(
+    agent: TriageAgent,
+    molecules: List[Tuple[str, str]],
+    output_path: Path,
+    *,
+    quiet: bool = False,
+) -> None:
+    """
+    Triage a batch of molecules sequentially.
+
+    Prints a summary table after all runs complete.
+
+    Args:
+        agent:       Initialised TriageAgent.
+        molecules:   List of (molecule_id, smiles) pairs.
+        output_path: JSONL file to append all RunRecords to.
+        quiet:       If True, suppress per-molecule text reports.
+    """
+    total = len(molecules)
+    results: List[Tuple[str, str, str]] = []  # (mol_id, smiles, decision_or_error)
+
+    print(f"\nRunning batch of {total} molecules → {output_path}\n")
+
+    for i, (mol_id, smiles) in enumerate(molecules, start=1):
+        print(f"[{i:>3}/{total}] {mol_id}  ({smiles[:40]}{'…' if len(smiles) > 40 else ''})")
+
+        try:
+            state = agent.run(molecule_id=mol_id, raw_input=smiles)
+        except Exception as exc:
+            logger.error("Pipeline error for %s: %s", mol_id, exc)
+            results.append((mol_id, smiles, "ERROR"))
+            continue
+
+        rationale_builder = RationaleBuilder()
+        explanation = rationale_builder.build(state)
+
+        if not quiet:
+            print(format_text(explanation))
+
+        record_builder = RunRecordBuilder()
+        record = record_builder.build(state, explanation)
+        try:
+            save_record(record, output_path)
+        except IOError as exc:
+            logger.error("Save failed for %s: %s", mol_id, exc)
+
+        results.append((mol_id, smiles, explanation.decision))
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    print("\n" + "═" * 58)
+    print("  BATCH SUMMARY")
+    print("═" * 58)
+    counts: dict = {"PASS": 0, "FLAG": 0, "DISCARD": 0, "ERROR": 0}
+    for mol_id, smiles, decision in results:
+        d = decision if decision in counts else "ERROR"
+        counts[d] += 1
+        badge = {"PASS": "✓", "FLAG": "⚑", "DISCARD": "✗", "ERROR": "!"}.get(d, "?")
+        print(f"  {badge}  {mol_id:<20}  {d}")
+    print("─" * 58)
+    print(
+        f"  Total {total}:  "
+        f"PASS {counts['PASS']}  "
+        f"FLAG {counts['FLAG']}  "
+        f"DISCARD {counts['DISCARD']}  "
+        f"ERROR {counts['ERROR']}"
     )
-    logging.info(
-        "Note: SimilarityTool will make live API calls — expect ~3-8s latency."
+    print("═" * 58)
+    print(f"\nRun records saved to: {output_path}\n")
+
+
+# ============================================================================
+# Smoke test (Week 3-5 behaviour — preserved for regression testing)
+# ============================================================================
+
+def run_smoke_test(agent: TriageAgent, output_path: Path) -> None:
+    """
+    Original Week 3-5 smoke test: triage ethanol (CCO).
+
+    Preserved to ensure backwards compatibility with the old `python main.py`
+    invocation. Now also saves a run record and prints the full explanation.
+    """
+    print("\nRunning Week 3-5 smoke test: ethanol (CCO)\n")
+    triage_molecule(
+        agent=agent,
+        smiles="CCO",
+        molecule_id="smoke_test_ethanol",
+        output_path=output_path,
+        quiet=False,
+    )
+    logger.info("Smoke test complete.")
+
+
+# ============================================================================
+# Logging configuration
+# ============================================================================
+
+def configure_logging(quiet: bool = False) -> None:
+    """Configure logging. In quiet mode, suppress INFO logs from pipeline internals."""
+    level = logging.WARNING if quiet else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    # Execute the full pipeline (exceptions propagate — fail-fast)
-    state = agent.run(molecule_id=molecule_id, raw_input=raw_input)
-    decision = state.decision
 
-    logging.info("Triage completed. Decision: %s", decision)
-    logging.info("=" * 60)
-    logging.info("Smoke test PASSED")
-    logging.info("=" * 60)
+# ============================================================================
+# CLI
+# ============================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="triflag",
+        description="TRI_FLAG — Explainable molecular triage agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --smiles "CCO" --id ethanol_001
+  python main.py --input molecules.csv --output results/batch_01.jsonl
+  python main.py --smiles "CCO" --no-similarity --quiet
+  python main.py                                  (smoke test)
+        """,
+    )
+
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--smiles", "-s",
+        metavar="SMILES",
+        help="SMILES string of a single molecule to triage.",
+    )
+    input_group.add_argument(
+        "--input", "-i",
+        metavar="CSV",
+        type=Path,
+        help="CSV file for batch triage. Required columns: molecule_id, smiles.",
+    )
+
+    parser.add_argument(
+        "--id",
+        metavar="ID",
+        default=None,
+        help="Molecule identifier for --smiles mode (default: 'mol_001').",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        metavar="JSONL",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help=f"JSONL file to append run records to (default: {DEFAULT_OUTPUT}).",
+    )
+    parser.add_argument(
+        "--no-similarity",
+        action="store_true",
+        help="Skip SimilarityTool. Faster offline runs; no IP screening.",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress text reports. Run records are still saved.",
+    )
+
+    return parser
 
 
 def main() -> None:
-    """
-    Main entry point for TRI_FLAG system.
+    parser = build_parser()
+    args = parser.parse_args()
 
-    Orchestrates:
-        1. Logging configuration
-        2. Component initialization (tools, policy engine, agent)
-        3. Smoke test execution
-        4. Clean exit
+    configure_logging(quiet=args.quiet)
 
-    Error handling:
-        Exceptions propagate to caller (fail-fast for development).
-    """
-    configure_logging()
-
-    logging.info("Initializing TRI_FLAG components (Week 5)...")
-    tools = initialize_tools()
+    use_similarity = not args.no_similarity
+    tools = initialize_tools(use_similarity=use_similarity)
     policy_engine = initialize_policy_engine()
     agent = initialize_agent(tools=tools, policy_engine=policy_engine)
 
-    run_smoke_test(agent)
+    output_path: Path = args.output
 
-    logging.info("TRI_FLAG system execution complete")
+    # ── Route to appropriate run mode ────────────────────────────────────────
+    if args.smiles:
+        molecule_id = args.id or "mol_001"
+        success = triage_molecule(
+            agent=agent,
+            smiles=args.smiles,
+            molecule_id=molecule_id,
+            output_path=output_path,
+            quiet=args.quiet,
+        )
+        sys.exit(0 if success else 1)
+
+    elif args.input:
+        molecules = load_molecules_from_csv(args.input)
+        run_batch(
+            agent=agent,
+            molecules=molecules,
+            output_path=output_path,
+            quiet=args.quiet,
+        )
+        sys.exit(0)
+
+    else:
+        # No args — run original smoke test for backwards compatibility
+        run_smoke_test(agent=agent, output_path=output_path)
+        sys.exit(0)
 
 
 if __name__ == "__main__":

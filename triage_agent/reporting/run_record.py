@@ -1,41 +1,28 @@
 """
 reporting/run_record.py
 
-TRI_FLAG Week 6 — Run Record & Persistence
-
-Serialises a completed triage run (AgentState + TriageExplanation) into a
-flat, fully-typed RunRecord and persists it to an append-mode JSONL file.
-
-Each line in the JSONL file is one self-contained JSON object representing
-a single molecule's complete triage run — safe to stream, query, or load
-into pandas / a database later.
-
-Design goals:
-    - Zero loss: every field from every tool result is captured
-    - Forward-compatible: new fields added as nullable, old records still load
-    - Optional AI reviewer slot: present but null until Week 7+ wires it up
-    - DB-ready schema: field names and types match the planned SQL schema exactly
-    - Atomic writes: partial JSONL lines never appear on disk
-
-Public API:
-    build(state, explanation, *, ai_review=None) -> RunRecord
-    save(record, path)                           -> None   (appends to JSONL)
-    load_all(path)                               -> list[RunRecord]
-    load_as_dicts(path)                          -> list[dict]
-
-Week: 6
+Week 8 changes:
+  - Added imports: compute_reward, DatabaseManager
+  - RunRecord: added reward, s_sa, s_nov, s_qed, s_act, batch_id,
+               generation_number, entry_point fields
+  - RunRecordBuilder.build(): calls compute_reward() before returning
+  - RunRecord.save(): replaced JSONL body with DatabaseManager.save_run()
+  - load_all() / load_as_dicts() / save() module-level functions unchanged
+    (JSONL round-trip still works for legacy reads; new writes go to SQLite)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from reporting.scoring import compute_reward          # Week 8
+from database.db import DatabaseManager              # Week 8
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +88,8 @@ class RunRecord:
         Explanation     — explanation_summary, explanation_sections
         AI review       — ai_review (AIReviewRecord | None)
         Run metadata    — thresholds_preset, execution_time_ms, early_termination
+        Week 8          — reward, s_sa, s_nov, s_qed, s_act, batch_id,
+                          generation_number, entry_point
     """
 
     # ── Run identity ────────────────────────────────────────────────────────
@@ -162,6 +151,18 @@ class RunRecord:
     total_execution_time_ms: Optional[float]
     tools_executed: List[str]            # tool names that actually ran
 
+    # ── Week 8: reward signal ────────────────────────────────────────────────
+    reward: Optional[float] = None       # final multiplicative reward in [0, 1]
+    s_sa: Optional[float] = None         # sigmoid SA component
+    s_nov: Optional[float] = None        # two-zone novelty component
+    s_qed: Optional[float] = None        # RDKit QED component
+    s_act: Optional[float] = None        # DeepPurpose binding component (Week 11)
+
+    # ── Week 8: ACEGEN batch tracking ────────────────────────────────────────
+    batch_id: Optional[str] = None       # e.g. "gen_001"
+    generation_number: Optional[int] = None
+    entry_point: Optional[str] = None    # "cli" | "streamlit" | "mcp"
+
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert to a fully JSON-serialisable dict.
@@ -192,6 +193,21 @@ class RunRecord:
         filtered = {k: v for k, v in data.items() if k in known_fields and k != "ai_review"}
         filtered["ai_review"] = ai_review
         return cls(**filtered)
+
+    def save(self, db_path: str = "runs/triflag.db") -> None:
+        """
+        Persist this run to SQLite via DatabaseManager.
+
+        Week 8+: replaces the previous JSONL append approach. Called from
+        CLI (main.py), Streamlit (streamlit_app.py), and MCP (mcp_server.py)
+        without any changes to those entry points — save() is the single
+        write point.
+
+        Args:
+            db_path: Path to the SQLite file. Created automatically if absent.
+        """
+        db = DatabaseManager(db_path)
+        db.save_run(self)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +248,7 @@ class RunRecordBuilder:
         sa = self._unwrap(state.tool_results.get("SAScoreTool", {}))
         sim = self._unwrap(state.tool_results.get("SimilarityTool", {}))
 
-        return RunRecord(
+        record = RunRecord(
             # ── Identity ────────────────────────────────────────────────
             run_id=str(uuid.uuid4()),
             molecule_id=state.molecule_id,
@@ -300,7 +316,28 @@ class RunRecordBuilder:
             termination_reason=explanation.termination_reason,
             total_execution_time_ms=self._compute_total_ms(state),
             tools_executed=list(state.tool_results.keys()),
+
+            # ── Week 8 defaults (batch_id / generation_number / entry_point
+            #    are stamped on by the caller — main.py, streamlit, mcp) ──
+            reward=None,
+            s_sa=None,
+            s_nov=None,
+            s_qed=None,
+            s_act=None,
+            batch_id=None,
+            generation_number=None,
+            entry_point=None,
         )
+
+        # Week 8: compute reward and store all components on the record
+        reward_result = compute_reward(record)
+        record.reward = reward_result.reward
+        record.s_sa   = reward_result.s_sa
+        record.s_nov  = reward_result.s_nov
+        record.s_qed  = reward_result.s_qed
+        # record.s_act stays None until Week 11 (DeepPurpose)
+
+        return record
 
     # ------------------------------------------------------------------
     # Helpers
@@ -337,12 +374,16 @@ class RunRecordBuilder:
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Module-level persistence helpers (JSONL — kept for legacy reads)
 # ---------------------------------------------------------------------------
 
 def save(record: RunRecord, path: str | Path) -> None:
     """
     Append a RunRecord as a single JSON line to a JSONL file.
+
+    NOTE (Week 8): New writes go to SQLite via record.save(). This function
+    is retained for any tooling that still reads the JSONL history, and for
+    explicit export / backup use cases.
 
     Creates the file and any parent directories if they do not exist.
     Uses an atomic rename strategy on the same filesystem to prevent
@@ -363,19 +404,17 @@ def save(record: RunRecord, path: str | Path) -> None:
     # Atomic append: write to a temp file then rename (same-dir, same-fs)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     try:
-        # Read existing content
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         new_content = existing + line + "\n"
         tmp_path.write_text(new_content, encoding="utf-8")
         tmp_path.replace(path)
     except Exception:
-        # Clean up temp file on failure
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         raise
 
     logger.debug(
-        "RunRecord saved: run_id=%s molecule=%s decision=%s → %s",
+        "RunRecord saved (JSONL): run_id=%s molecule=%s decision=%s → %s",
         record.run_id, record.molecule_id, record.final_decision, path,
     )
 

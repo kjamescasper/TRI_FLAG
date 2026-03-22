@@ -1,7 +1,7 @@
 """
 reporting/rationale_builder.py
 
-TRI_FLAG Week 6 — Flat Rationale Builder
+TRI_FLAG Week 9 — Flat Rationale Builder
 
 Produces a structured, plain-English explanation of a triage decision by
 reading directly from AgentState.tool_results. Intentionally decoupled from
@@ -26,6 +26,7 @@ Output structure (TriageExplanation):
     .sections            list[ExplanationSection]
         each section:
             .tool        str          "Validity" | "SA Score" | "Similarity"
+                                      | "Descriptors" | "PAINS"
             .status      str          "PASS" | "FLAG" | "DISCARD" | "ERROR" | "SKIPPED"
             .headline    str          short verdict for this check
             .details     list[str]    supporting detail lines
@@ -33,7 +34,17 @@ Output structure (TriageExplanation):
     .early_termination   bool
     .termination_reason  str | None
 
-Week: 6
+Week 9 additions:
+    _build_descriptor_section() — physicochemical property table
+    _build_pains_section()      — PAINS structural alert list
+    Both sections inserted into build() when validity passed.
+
+Week 9 (similarity update):
+    _build_similarity_section() updated for three-source architecture:
+        ChEMBL     — flagging source (approved/bioactive drugs)
+        SureChEMBL — flagging source (patent literature)
+        PubChem    — informational only, rendered as a reference note,
+                     never cited as the reason for a FLAG decision
 """
 
 from __future__ import annotations
@@ -153,12 +164,22 @@ class RationaleBuilder:
         sections: List[ExplanationSection] = []
         sections.append(self._build_validity_section(state))
 
-        # Only build SA / Similarity sections if validity passed
+        # Only build downstream sections if validity passed
         validity_result = state.tool_results.get("ValidityTool", {})
         validity_data = self._unwrap_result(validity_result)
         if validity_data.get("is_valid", False):
+            # ═══════════════════════════════════════════════════════════
+            # WEEK 9 ADDITION: Descriptor section (position 2 in pipeline)
+            # ═══════════════════════════════════════════════════════════
+            sections.append(self._build_descriptor_section(state))
+            # ═══════════════════════════════════════════════════════════
             sections.append(self._build_sa_section(state))
             sections.append(self._build_similarity_section(state))
+            # ═══════════════════════════════════════════════════════════
+            # WEEK 9 ADDITION: PAINS section (position 5 in pipeline)
+            # ═══════════════════════════════════════════════════════════
+            sections.append(self._build_pains_section(state))
+            # ═══════════════════════════════════════════════════════════
 
         summary = self._compose_summary(state.molecule_id, decision_str, sections, flags)
 
@@ -223,6 +244,91 @@ class RationaleBuilder:
                 details=details,
             )
 
+    # ══════════════════════════════════════════════════════════════════════
+    # WEEK 9 ADDITION: Descriptor section
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _build_descriptor_section(self, state: Any) -> ExplanationSection:
+        """
+        Build the physicochemical descriptor section.
+
+        Renders MW, logP, TPSA, HBD, HBA, rotatable bonds, and scaffold SMILES
+        as a compact property table. Flags Lipinski violations inline.
+        Shown only when validity passed and DescriptorTool ran.
+        """
+        result = state.tool_results.get("DescriptorTool")
+        if result is None:
+            return ExplanationSection(
+                tool="Descriptors",
+                status="SKIPPED",
+                headline="Descriptor calculation did not run (Week 9 tool not yet registered).",
+            )
+
+        data = self._unwrap_result(result)
+        error_msg: Optional[str] = data.get("error_message")
+
+        if error_msg:
+            return ExplanationSection(
+                tool="Descriptors",
+                status="ERROR",
+                headline="Descriptor calculation failed — values unavailable.",
+                details=[f"Error: {error_msg}"],
+            )
+
+        mw = data.get("mol_weight")
+        logp = data.get("logp")
+        tpsa = data.get("tpsa")
+        hbd = data.get("hbd")
+        hba = data.get("hba")
+        rot = data.get("rotatable_bonds")
+        scaffold = data.get("scaffold_smiles")
+
+        # Check Lipinski violations for inline annotation
+        violations = []
+        if mw is not None and mw > 500:
+            violations.append(f"MW={mw:.1f} Da exceeds 500")
+        if logp is not None and logp > 5:
+            violations.append(f"logP={logp:.2f} exceeds 5")
+        if hbd is not None and hbd > 5:
+            violations.append(f"HBD={hbd} exceeds 5")
+        if hba is not None and hba > 10:
+            violations.append(f"HBA={hba} exceeds 10")
+
+        status = "FLAG" if violations else "PASS"
+        headline = (
+            "Lipinski Ro5 violation detected — oral bioavailability may be reduced."
+            if violations else
+            "Physicochemical properties calculated — Lipinski Ro5 compliant."
+        )
+
+        details = [
+            f"  MW:              {mw:.3f} Da" if mw is not None else "  MW:              N/A",
+            f"  logP:            {logp:.3f}" if logp is not None else "  logP:            N/A",
+            f"  TPSA:            {tpsa:.3f} Å²" if tpsa is not None else "  TPSA:            N/A",
+            f"  HBD / HBA:       {hbd} / {hba}" if (hbd is not None and hba is not None) else "  HBD / HBA:       N/A",
+            f"  Rotatable bonds: {rot}" if rot is not None else "  Rotatable bonds: N/A",
+            f"  Scaffold:        {scaffold}" if scaffold else "  Scaffold:        N/A",
+        ]
+
+        if violations:
+            details.append("Lipinski violations:")
+            for v in violations:
+                details.append(f"  ⚠  {v}")
+
+        exec_ms = data.get("execution_time_ms", 0.0)
+        details.append(f"Computed in {exec_ms:.1f} ms.")
+
+        return ExplanationSection(
+            tool="Descriptors",
+            status=status,
+            headline=headline,
+            details=details,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # END WEEK 9 ADDITION: Descriptor section
+    # ══════════════════════════════════════════════════════════════════════
+
     def _build_sa_section(self, state: Any) -> ExplanationSection:
         """Build the SA Score section."""
         result = state.tool_results.get("SAScoreTool")
@@ -257,7 +363,6 @@ class RationaleBuilder:
         if description:
             details.append(description)
 
-        # Threshold context
         details.append(
             f"Thresholds: PASS < 6.0, FLAG 6.0–7.0, DISCARD > 7.0  "
             f"(scale: 1 = trivially easy, 10 = practically impossible)"
@@ -278,7 +383,15 @@ class RationaleBuilder:
         )
 
     def _build_similarity_section(self, state: Any) -> ExplanationSection:
-        """Build the Similarity / IP-risk section."""
+        """
+        Build the Similarity / IP-risk section.
+
+        Three-source architecture (Week 9):
+            ChEMBL     — flagging source, full hit details rendered
+            SureChEMBL — flagging source, patent context rendered
+            PubChem    — informational only, rendered as a reference note,
+                         never cited as the reason for a FLAG decision
+        """
         result = state.tool_results.get("SimilarityTool")
         if result is None:
             return ExplanationSection(
@@ -288,75 +401,95 @@ class RationaleBuilder:
             )
 
         data = self._unwrap_result(result)
-        sim_decision: str = data.get("similarity_decision", "ERROR")
-        nn_tanimoto: float = data.get("nearest_neighbor_tanimoto", 0.0)
+        sim_decision: str        = data.get("similarity_decision", "ERROR")
+        nn_tanimoto: float       = data.get("nearest_neighbor_tanimoto", 0.0)
         nn_source: Optional[str] = data.get("nearest_neighbor_source")
-        nn_id: Optional[str] = data.get("nearest_neighbor_id")
-        nn_name: Optional[str] = data.get("nearest_neighbor_name")
+        nn_id: Optional[str]     = data.get("nearest_neighbor_id")
+        nn_name: Optional[str]   = data.get("nearest_neighbor_name")
         nn_smiles: Optional[str] = data.get("nearest_neighbor_smiles")
-        chembl_hits: List[dict] = data.get("chembl_hits", [])
-        pubchem_hits: List[dict] = data.get("pubchem_hits", [])
-        flag_threshold: float = data.get("flag_threshold_used", 0.85)
-        escalation_threshold: float = 0.95  # matches thresholds.py default
-        apis_queried: List[str] = data.get("apis_queried", [])
-        exec_ms: float = data.get("execution_time_ms", 0.0)
+
+        chembl_hits: List[dict]     = data.get("chembl_hits", [])
+        surechembl_hits: List[dict] = data.get("surechembl_hits", [])
+        pubchem_hits: List[dict]    = data.get("pubchem_hits", [])
+
+        flag_threshold: float       = data.get("flag_threshold_used", 0.90)
+        escalation_threshold: float = 0.95
+        apis_queried: List[str]     = data.get("apis_queried", [])
+        exec_ms: float              = data.get("execution_time_ms", 0.0)
         error_reason: Optional[str] = data.get("error_reason")
 
+        # ── ERROR ─────────────────────────────────────────────────────────
         if sim_decision == "ERROR":
             return ExplanationSection(
                 tool="Similarity",
                 status="ERROR",
                 headline="Similarity search failed — flagged conservatively.",
                 details=[
-                    f"Error: {error_reason}" if error_reason else "API unavailable.",
-                    "Conservative FLAG applied: similarity could not be confirmed as safe.",
+                    f"Error: {error_reason}" if error_reason else "Flagging APIs unavailable.",
+                    "Conservative FLAG applied: IP risk could not be confirmed as safe.",
                 ],
             )
 
-        # Build headline
+        # ── Headline ──────────────────────────────────────────────────────
         if sim_decision == "PASS":
             headline = (
-                f"No similar known compounds found "
-                f"(best Tanimoto {nn_tanimoto:.3f} < {flag_threshold} threshold) — PASS."
+                f"No similar compounds found in patent or drug databases "
+                f"(best Tanimoto {nn_tanimoto:.3f} < {flag_threshold:.2f} threshold) — PASS."
             )
         else:
-            escalated = nn_tanimoto >= escalation_threshold
-            severity = "near-identical" if escalated else "similar"
-            nn_label = nn_name or nn_id or "unknown"
+            escalated    = nn_tanimoto >= escalation_threshold
+            severity     = "near-identical" if escalated else "similar"
+            nn_label     = nn_name or nn_id or "unknown"
             source_label = nn_source or "unknown source"
             headline = (
-                f"Flagged: {severity} to known compound "
-                f"{nn_label} [{source_label}] "
-                f"(Tanimoto {nn_tanimoto:.3f} >= {flag_threshold} threshold)."
+                f"Flagged: {severity} to {nn_label} [{source_label}] "
+                f"(Tanimoto {nn_tanimoto:.3f} >= {flag_threshold:.2f} threshold)."
             )
 
         details = []
 
-        # Nearest-neighbor detail
+        # ── Nearest neighbour (flagging sources only) ─────────────────────
         if nn_tanimoto > 0.0 and nn_id:
-            nn_line = f"Nearest neighbor: {nn_name or 'unnamed'} | ID: {nn_id} | Source: {nn_source or '?'} | Tanimoto: {nn_tanimoto:.3f}"
+            nn_line = (
+                f"Nearest neighbor: {nn_name or 'unnamed'} | "
+                f"ID: {nn_id} | Source: {nn_source or '?'} | "
+                f"Tanimoto: {nn_tanimoto:.3f}"
+            )
             details.append(nn_line)
             if nn_smiles:
                 details.append(f"  NN SMILES: {nn_smiles}")
 
-        # Hit counts per source
+        # ── ChEMBL hits ───────────────────────────────────────────────────
         if chembl_hits:
             best_chembl = max(chembl_hits, key=lambda h: h.get("tanimoto", 0.0))
             details.append(
                 f"ChEMBL: {len(chembl_hits)} hit(s) above threshold "
                 f"(best: {best_chembl.get('tanimoto', 0.0):.3f}, ID: {best_chembl.get('id', '?')})"
             )
-        if pubchem_hits:
-            best_pubchem = max(pubchem_hits, key=lambda h: h.get("tanimoto", 0.0))
+
+        # ── SureChEMBL hits ───────────────────────────────────────────────
+        if surechembl_hits:
+            best_sc    = max(surechembl_hits, key=lambda h: h.get("tanimoto", 0.0))
+            patent_ids = best_sc.get("patent_ids", [])
+            patent_note = f", patent: {patent_ids[0]}" if patent_ids else ""
             details.append(
-                f"PubChem: {len(pubchem_hits)} hit(s) above threshold "
-                f"(best: {best_pubchem.get('tanimoto', 0.0):.3f}, ID: {best_pubchem.get('id', '?')})"
+                f"SureChEMBL: {len(surechembl_hits)} hit(s) in patent literature "
+                f"(best: {best_sc.get('tanimoto', 0.0):.3f}, "
+                f"ID: {best_sc.get('id', '?')}{patent_note})"
             )
 
-        # Threshold and escalation context
+        # ── PubChem — informational note only ─────────────────────────────
+        if pubchem_hits:
+            details.append(
+                f"PubChem reference: {len(pubchem_hits)} structurally related "
+                f"compound(s) found (informational only — not used for FLAG decision)."
+            )
+
+        # ── Threshold context ─────────────────────────────────────────────
         details.append(
-            f"Thresholds: FLAG >= {flag_threshold:.2f}, "
-            f"escalated (near-identical) >= {escalation_threshold:.2f}"
+            f"FLAG sources: ChEMBL (approved drugs) and SureChEMBL (patent literature). "
+            f"Threshold: Tanimoto >= {flag_threshold:.2f}. "
+            f"Escalated (near-identical): >= {escalation_threshold:.2f}."
         )
         if nn_tanimoto >= escalation_threshold and sim_decision == "FLAG":
             details.append(
@@ -364,7 +497,6 @@ class RationaleBuilder:
                 "Priority IP review required."
             )
 
-        # APIs queried
         if apis_queried:
             details.append(f"APIs queried: {', '.join(apis_queried)}")
         details.append(f"Completed in {exec_ms:.1f} ms.")
@@ -375,6 +507,84 @@ class RationaleBuilder:
             headline=headline,
             details=details,
         )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # WEEK 9 ADDITION: PAINS section
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _build_pains_section(self, state: Any) -> ExplanationSection:
+        """
+        Build the PAINS structural alert section.
+
+        Renders matched PAINS pattern names with a one-line explanation of
+        what PAINS means. Advisory only — never causes DISCARD.
+        Shown only when validity passed and PAINSTool ran.
+        """
+        result = state.tool_results.get("PAINSTool")
+        if result is None:
+            return ExplanationSection(
+                tool="PAINS",
+                status="SKIPPED",
+                headline="PAINS screen did not run (Week 9 tool not yet registered).",
+            )
+
+        data = self._unwrap_result(result)
+        error_msg: Optional[str] = data.get("error_message")
+
+        if error_msg:
+            return ExplanationSection(
+                tool="PAINS",
+                status="ERROR",
+                headline="PAINS screen failed — structural alert status unknown.",
+                details=[f"Error: {error_msg}"],
+            )
+
+        pains_alert: bool = data.get("pains_alert", False)
+        pains_matches: List[str] = data.get("pains_matches", [])
+        exec_ms: float = data.get("execution_time_ms", 0.0)
+
+        if not pains_alert:
+            return ExplanationSection(
+                tool="PAINS",
+                status="PASS",
+                headline="No PAINS structural alerts detected.",
+                details=[
+                    "PAINS (Pan-Assay Interference Compounds) are motifs known to cause "
+                    "false positives in biochemical assays. None matched.",
+                    f"Screened in {exec_ms:.1f} ms.",
+                ],
+            )
+
+        # PAINS matched — build advisory FLAG section
+        headline = (
+            f"PAINS alert: {len(pains_matches)} structural pattern(s) matched — advisory FLAG."
+        )
+
+        details = [
+            "PAINS (Pan-Assay Interference Compounds) are structural motifs known to",
+            "cause false positives in biochemical assays due to reactivity, fluorescence",
+            "interference, or aggregation. Not disqualifying — flag for wet-lab follow-up.",
+            "Matched patterns:",
+        ]
+        for pattern in pains_matches:
+            details.append(f"  • {pattern}")
+
+        details.append(
+            "Recommendation: confirm activity with orthogonal assay before committing "
+            "to this scaffold."
+        )
+        details.append(f"Screened in {exec_ms:.1f} ms.")
+
+        return ExplanationSection(
+            tool="PAINS",
+            status="FLAG",
+            headline=headline,
+            details=details,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # END WEEK 9 ADDITION: PAINS section
+    # ══════════════════════════════════════════════════════════════════════
 
     # ------------------------------------------------------------------
     # Summary composition
@@ -410,6 +620,10 @@ class RationaleBuilder:
 
         if decision == "FLAG":
             flag_sources = [f["source"] for f in flags] if flags else []
+            # Check for PAINS in summary
+            pains_flagged = "PAINSTool" in flag_sources or statuses.get("PAINS") == "FLAG"
+            lipinski_flagged = any("Lipinski" in str(f.get("reason", "")) for f in flags)
+
             if "SAScoreTool" in flag_sources and "SimilarityTool" in flag_sources:
                 return (
                     f"{molecule_id} was flagged for human review: "
@@ -423,6 +637,16 @@ class RationaleBuilder:
                 return f"{molecule_id} was flagged for IP review{hint}."
             if "SAScoreTool" in flag_sources:
                 return f"{molecule_id} was flagged: SA score in borderline range (6.0–7.0)."
+            if pains_flagged:
+                return (
+                    f"{molecule_id} was flagged: PAINS structural alert detected — "
+                    f"confirm activity with orthogonal assay."
+                )
+            if lipinski_flagged:
+                return (
+                    f"{molecule_id} was flagged: Lipinski rule-of-five violation — "
+                    f"oral bioavailability may be reduced."
+                )
             return f"{molecule_id} was flagged for human review."
 
         if decision == "PASS":
@@ -446,7 +670,6 @@ class RationaleBuilder:
         dt = getattr(decision, "decision_type", None)
         if dt is None:
             return "UNKNOWN"
-        # DecisionType enum has .value ("pass"/"flag"/"discard") or .name ("PASS"/"FLAG"/"DISCARD")
         return dt.name if hasattr(dt, "name") else str(dt).upper()
 
     @staticmethod

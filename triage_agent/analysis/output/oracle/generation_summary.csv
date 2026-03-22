@@ -1,0 +1,3 @@
+batch_id,count,mean_reward,std_reward,pass_rate,flag_rate,discard_rate,unique_scaffolds,convergence_warning
+gen_001,1,0.0,0.0,0.0,1.0,0.0,0,False
+ungrouped,11,0.3067,0.1962,0.5455,0.4545,0.0,0,False

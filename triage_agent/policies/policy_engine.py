@@ -9,6 +9,10 @@ Week 4: SA score check -> DISCARD if SA > 7, FLAG if 6-7 (continues), PASS if < 
 Week 5: Similarity/IP-risk check -> FLAG on Tanimoto >= 0.85 (never DISCARD)
          Dual-source ChEMBL + PubChem reporting; escalation for Tanimoto >= 0.95
 Week 6: Fix — SA PASS no longer accumulated as flag contributor in evaluate().
+Week 9: Lipinski Ro5 checks from DescriptorTool results (advisory FLAG, no DISCARD).
+        PAINS advisory FLAG from PAINSTool results (advisory FLAG, no DISCARD).
+        Neither check changes DISCARD/PASS logic — they annotate state with FLAGS
+        so the rationale text is more informative.
 
 ARCHITECTURE NOTE
 -----------------
@@ -139,6 +143,10 @@ class PolicyEngine:
         4. Legacy pluggable policies (Week 3 design, still supported)
         5. Default fallback -- FLAG (conservative, no decisive result found)
 
+    Advisory annotations (Week 9, do not change routing outcome):
+        - DescriptorTool: Lipinski Ro5 violations added as FLAGS to state
+        - PAINSTool:      PAINS structural alerts added as FLAGS to state
+
     Returns a Decision object (from agent/decision.py). Interface is unchanged
     from Week 3 -- evaluate() signature and return type are identical.
     """
@@ -179,8 +187,23 @@ class PolicyEngine:
         accumulated. Only FLAG and DISCARD SA results are carried forward.
         This prevents a PASS SA score from being incorrectly composed with
         a similarity FLAG to produce a misleading "SA + Similarity" dual-flag.
+
+        Week 9 addition: Lipinski and PAINS advisory checks run after the
+        routing decision is determined. They annotate state with FLAGS but
+        never override a PASS, FLAG, or DISCARD outcome.
         """
         self._validate_state(state)
+
+        # ═══════════════════════════════════════════════════════════════
+        # WEEK 9 ADDITION: Advisory checks — run first so FLAGS are in
+        # state before the Decision is finalised and rationale is built.
+        # These never change the routing outcome.
+        # ═══════════════════════════════════════════════════════════════
+        self._check_lipinski(state)
+        self._check_pains(state)
+        # ═══════════════════════════════════════════════════════════════
+        # END WEEK 9 ADDITION
+        # ═══════════════════════════════════════════════════════════════
 
         # -- Week 3: validity check (highest priority) -------------------
         pd = self._check_validity(state)
@@ -492,6 +515,98 @@ class PolicyEngine:
                 "similarity_flag_metadata": sim_pd.metadata,
             },
         )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # WEEK 9 ADDITION: Advisory checks — Lipinski Ro5 and PAINS
+    # These methods annotate state with advisory FLAGS. They never return
+    # a PolicyDecision and never influence the routing outcome. Called at
+    # the top of evaluate() so FLAGS appear in state before the Decision
+    # is finalised and rationale is rendered.
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _check_lipinski(self, state: AgentState) -> None:
+        """
+        Add advisory FLAGs for Lipinski rule-of-five violations.
+
+        Thresholds: MW > 500 Da, logP > 5, HBD > 5, HBA > 10.
+        These are informational only — a Lipinski violation does not
+        change the PASS/FLAG/DISCARD outcome. It annotates the rationale
+        so a medicinal chemist reviewing the output knows to investigate
+        oral bioavailability.
+        """
+        desc = state.tool_results.get("DescriptorTool")
+        if not desc:
+            return
+
+        # Unwrap ToolResult if needed
+        if hasattr(desc, "data"):
+            desc = desc.data or {}
+
+        # Skip if descriptor calculation itself failed
+        if desc.get("error_message"):
+            return
+
+        violations = []
+        mw = desc.get("mol_weight")
+        logp = desc.get("logp")
+        hbd = desc.get("hbd")
+        hba = desc.get("hba")
+
+        if mw is not None and mw > 500:
+            violations.append(f"MW={mw:.1f} Da (>500)")
+        if logp is not None and logp > 5:
+            violations.append(f"logP={logp:.2f} (>5)")
+        if hbd is not None and hbd > 5:
+            violations.append(f"HBD={hbd} (>5)")
+        if hba is not None and hba > 10:
+            violations.append(f"HBA={hba} (>10)")
+
+        if violations:
+            reason = "Lipinski Ro5 violation: " + "; ".join(violations)
+            logger.info("[%s] Advisory FLAG: %s", state.molecule_id, reason)
+            if hasattr(state, "add_flag"):
+                state.add_flag(reason=reason, source="PolicyEngine")
+
+    def _check_pains(self, state: AgentState) -> None:
+        """
+        Add advisory FLAG if PAINSTool detected a PAINS structural alert.
+
+        PAINSTool.run() already calls state.add_flag() when it finds a match,
+        so this method only fires if PAINSTool ran but its own flag was not
+        added (e.g. if the tool is used without the agent pipeline). In normal
+        pipeline operation this is a no-op — the flag is already in state.
+        Kept here for completeness and for direct PolicyEngine usage outside
+        the agent (e.g. batch scoring without TriageAgent).
+        """
+        pains = state.tool_results.get("PAINSTool")
+        if not pains:
+            return
+
+        # Unwrap ToolResult if needed
+        if hasattr(pains, "data"):
+            pains = pains.data or {}
+
+        if not pains.get("pains_alert", False):
+            return
+
+        # Check if flag already exists in state to avoid duplicates
+        existing_flags = getattr(state, "_flags", [])
+        already_flagged = any(
+            "PAINS" in str(f) for f in existing_flags
+        )
+        if already_flagged:
+            return
+
+        matches = pains.get("pains_matches", [])
+        summary = ", ".join(matches[:3]) if matches else "unknown pattern"
+        reason = f"PAINS structural alert: {summary}"
+        logger.info("[%s] Advisory FLAG (PolicyEngine): %s", state.molecule_id, reason)
+        if hasattr(state, "add_flag"):
+            state.add_flag(reason=reason, source="PolicyEngine")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # END WEEK 9 ADDITION
+    # ══════════════════════════════════════════════════════════════════════
 
     # ------------------------------------------------------------------
     # Helpers

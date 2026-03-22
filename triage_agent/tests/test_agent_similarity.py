@@ -19,6 +19,17 @@ Design:
       manual validation against real ChEMBL/PubChem responses.
     - All Week 3/4 tests (test_agent.py) remain unchanged.
 
+Week 9 (similarity update):
+    SimilarityTool now uses three sources:
+        ChEMBL     — flagging source (approved/bioactive drugs)
+        SureChEMBL — flagging source (patent literature)
+        PubChem    — informational only, never triggers FLAG decision
+    test_flag_above_threshold_pubchem updated: PubChem hit alone → PASS
+        (PubChem is no longer a flagging source; result stored in pubchem_hits
+        for reference but does not drive the similarity_decision.)
+    test_flag_dual_source updated: ChEMBL hit → FLAG; PubChem stored but not
+        the causal source. Asserts FLAG decision and ChEMBL hit presence only.
+
 Usage:
     # Run offline tests (no network required)
     pytest tests/test_agent_week5.py -v
@@ -477,42 +488,59 @@ class TestSimilarityToolUnit:
     @patch("tools.similarity_tool._CHEMBL_CLIENT_AVAILABLE", False)
     @patch("tools.similarity_tool._requests")
     def test_flag_above_threshold_pubchem(self, mock_requests):
-        """PubChem hit above threshold → FLAG."""
+        """
+        PubChem hit alone → PASS.
+
+        Week 9 change: PubChem is informational only and never triggers FLAG.
+        A PubChem hit with no ChEMBL or SureChEMBL hits must produce PASS.
+        The hit is still stored in pubchem_hits for reference.
+        """
         # ChEMBL returns no hits
         mock_requests.get.side_effect = [
-            _make_chembl_response(hits=[]),   # ChEMBL similarity query
-            _make_pubchem_props_response([12345]),  # PubChem property fetch
+            _make_chembl_response(hits=[]),          # ChEMBL similarity query
+            _make_pubchem_props_response([12345]),    # PubChem property fetch
         ]
-        # PubChem: Waiting → CIDs
         mock_requests.post.return_value = MagicMock(
             status_code=200,
             raise_for_status=MagicMock(),
             json=MagicMock(return_value={"Waiting": {"ListKey": "KEY123"}}),
         )
-        # Poll response: CIDs ready
         poll_mock = MagicMock(
             status_code=200,
             raise_for_status=MagicMock(),
             json=MagicMock(return_value={"IdentifierList": {"CID": [12345]}}),
         )
-        # Second call to requests.get is the poll
+        # SureChEMBL also uses GET — add a no-hit response so PubChem gets its slot
+        surechembl_no_hits = MagicMock(
+            status_code=200,
+            raise_for_status=MagicMock(),
+            json=MagicMock(return_value={"results": []}),
+        )
         mock_requests.get.side_effect = [
-            _make_chembl_response(hits=[]),   # ChEMBL
-            poll_mock,                         # PubChem poll
-            _make_pubchem_props_response([12345]),  # PubChem props
+            _make_chembl_response(hits=[]),          # ChEMBL
+            surechembl_no_hits,                       # SureChEMBL
+            poll_mock,                                # PubChem poll
+            _make_pubchem_props_response([12345]),    # PubChem props
         ]
 
         state = self._make_state("CCO")
         result = self.tool.run(state)
 
-        # PubChem flags conservatively at flag_threshold
-        assert result["similarity_decision"] == "FLAG"
-        assert result["nearest_neighbor_source"] == "PubChem"
+        # PubChem is informational only — no flagging sources hit → PASS
+        assert result["similarity_decision"] == "PASS"
+        # PubChem result is still stored for reference
+        assert len(result["pubchem_hits"]) >= 1
+        assert result["pubchem_hits"][0]["informational"] is True
 
     @patch("tools.similarity_tool._CHEMBL_CLIENT_AVAILABLE", False)
     @patch("tools.similarity_tool._requests")
     def test_flag_dual_source(self, mock_requests):
-        """Both ChEMBL and PubChem return hits → FLAG with both in result."""
+        """
+        ChEMBL hit → FLAG; PubChem hit stored but not causal.
+
+        Week 9 change: FLAG is driven by ChEMBL hit. PubChem hit is stored
+        in pubchem_hits but does not affect the decision.
+        """
         mock_requests.get.side_effect = [
             _make_chembl_response(
                 hits=[_chembl_hit("CHEMBL1", "KnownDrug", 91.0)]
@@ -529,8 +557,15 @@ class TestSimilarityToolUnit:
             raise_for_status=MagicMock(),
             json=MagicMock(return_value={"IdentifierList": {"CID": [99999]}}),
         )
+        # SureChEMBL also uses GET — add a no-hit response so PubChem gets its slot
+        surechembl_no_hits = MagicMock(
+            status_code=200,
+            raise_for_status=MagicMock(),
+            json=MagicMock(return_value={"results": []}),
+        )
         mock_requests.get.side_effect = [
             _make_chembl_response(hits=[_chembl_hit("CHEMBL1", "KnownDrug", 91.0)]),
+            surechembl_no_hits,                       # SureChEMBL
             poll_mock,
             _make_pubchem_props_response([99999]),
         ]
@@ -538,8 +573,11 @@ class TestSimilarityToolUnit:
         state = self._make_state("CCO")
         result = self.tool.run(state)
 
+        # ChEMBL hit drives the FLAG
         assert result["similarity_decision"] == "FLAG"
+        assert result["flag_source"] == "ChEMBL"
         assert len(result["chembl_hits"]) >= 1
+        # PubChem hit is stored for reference
         assert len(result["pubchem_hits"]) >= 1
 
     # ── ERROR cases ────────────────────────────────────────────────────────────

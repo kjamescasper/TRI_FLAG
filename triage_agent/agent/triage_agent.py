@@ -3,7 +3,7 @@ agent/triage_agent.py
 
 TriageAgent: Central orchestration controller for molecular triage workflow.
 
-Week 5 Implementation — Similarity / IP-Risk Screening Integration
+Week 9 Implementation — Descriptor + PAINS Tool Integration
 
 This module implements the deterministic, state-centric agent that coordinates
 tool execution, maintains provenance, and delegates decision-making.
@@ -17,13 +17,14 @@ Design Principles:
     - Early termination allowed via explicit state signals
       (Week 3: invalid molecules; Week 4: SA > 7)
     - SimilarityTool never causes early termination — FLAG-and-continue
+    - DescriptorTool never causes early termination — enriches state only
+    - PAINSTool never causes early termination — advisory FLAG-and-continue
     - PolicyEngine evaluates completed state; does not control execution flow
 
-Week 5 change summary:
-    - Added SimilarityTool detection block after tool execution
-    - FLAG result: annotate state.add_flag(reason=..., source="SimilarityTool")
-    - ERROR result: annotate state.add_flag(reason=..., source="SimilarityTool")
-    - No break — pipeline always continues after SimilarityTool
+Week 9 change summary:
+    - Updated Tool Execution Semantics docstring (5-tool pipeline)
+    - Added DescriptorTool post-run block: logs descriptor values, non-terminal
+    - Added PAINSTool post-run block: logs PAINS alert, non-terminal
 """
 
 from typing import List, Optional
@@ -103,16 +104,19 @@ class TriageAgent:
     to the policy engine. Ensures deterministic, auditable execution with
     complete provenance tracking.
 
-    Tool Execution Semantics (Week 5):
-        1. ValidityTool  — runs first; invalid molecule → terminate early
-        2. SAScoreTool   — runs second; SA > 7 → terminate early
-        3. SimilarityTool — runs third; FLAG-only, never terminates early
-        4. (future tools)
+    Tool Execution Semantics (Week 9):
+        1. ValidityTool   — runs first; invalid molecule → terminate early
+        2. DescriptorTool — runs second; computes MW, logP, TPSA, scaffold; non-terminal
+        3. SAScoreTool    — runs third; SA > 7 → terminate early
+        4. SimilarityTool — runs fourth; FLAG-only, never terminates early
+        5. PAINSTool      — runs fifth; advisory PAINS flag; non-terminal
 
     Early termination signals:
         - ValidityTool: is_valid=False → state.terminate()
         - SAScoreTool: sa_decision="DISCARD" → state.terminate()
+        - DescriptorTool: failure → WARNING flag only, pipeline continues
         - SimilarityTool: FLAG or ERROR → state.add_flag() only (no terminate)
+        - PAINSTool: pains_alert=True → state.add_flag() only (no terminate)
 
     Attributes:
         tools: Ordered sequence of Tool instances to execute
@@ -161,8 +165,10 @@ class TriageAgent:
             3. Record all tool results (success or failure) in state
             4. Check for early termination between tools (validity, SA score)
             5. SimilarityTool: FLAG → add_flag(); ERROR → add_flag(); no break
-            6. Delegate decision-making to PolicyEngine
-            7. Finalize and return immutable state
+            6. DescriptorTool: always continues; failure adds WARNING flag
+            7. PAINSTool: match → add_flag(); always continues
+            8. Delegate decision-making to PolicyEngine
+            9. Finalize and return immutable state
 
         Args:
             molecule_id: Unique identifier for the molecule being triaged
@@ -262,6 +268,48 @@ class TriageAgent:
                             },
                         )
 
+                # ═══════════════════════════════════════════════════════════════
+                # WEEK 9 ADDITION: Post-run handling for DescriptorTool
+                # Non-terminal — descriptor failures add a WARNING flag but
+                # never stop the pipeline.
+                # ═══════════════════════════════════════════════════════════════
+                elif tool_name == "DescriptorTool":
+                    desc_data = (
+                        result.data if isinstance(result, ToolResult) else result
+                    )
+                    error_msg = desc_data.get("error_message")
+
+                    if error_msg:
+                        self.logger.warning(
+                            "DescriptorTool warning for %s: %s — pipeline continues",
+                            molecule_id,
+                            error_msg,
+                            extra={"molecule_id": molecule_id, "descriptor_error": error_msg},
+                        )
+                        if hasattr(state, "add_flag"):
+                            state.add_flag(
+                                reason=f"Descriptor calculation warning: {error_msg}",
+                                source="DescriptorTool",
+                            )
+                    else:
+                        self.logger.info(
+                            "DescriptorTool complete for %s: MW=%.1f logP=%.2f TPSA=%.1f",
+                            molecule_id,
+                            desc_data.get("mol_weight") or 0.0,
+                            desc_data.get("logp") or 0.0,
+                            desc_data.get("tpsa") or 0.0,
+                            extra={
+                                "molecule_id": molecule_id,
+                                "mol_weight": desc_data.get("mol_weight"),
+                                "logp": desc_data.get("logp"),
+                                "tpsa": desc_data.get("tpsa"),
+                                "scaffold_smiles": desc_data.get("scaffold_smiles"),
+                            },
+                        )
+                # ═══════════════════════════════════════════════════════════════
+                # END WEEK 9 ADDITION: DescriptorTool
+                # ═══════════════════════════════════════════════════════════════
+
                 # ── Post-run handling: SAScoreTool (Week 4) ──────────────────
                 elif tool_name == "SAScoreTool":
                     sa_data = (
@@ -308,9 +356,7 @@ class TriageAgent:
                                 source="SAScoreTool",
                             )
 
-                # ═══════════════════════════════════════════════════════════════
-                # WEEK 5 ADDITION: Post-run handling for SimilarityTool
-                # ═══════════════════════════════════════════════════════════════
+                # ── Post-run handling: SimilarityTool (Week 5) ───────────────
                 elif tool_name == "SimilarityTool":
                     sim_data = (
                         result.data if isinstance(result, ToolResult) else result
@@ -335,7 +381,6 @@ class TriageAgent:
                                 "nearest_neighbor_id": nn_id,
                             },
                         )
-                        # Annotate state — pipeline continues (no terminate())
                         if hasattr(state, "add_flag"):
                             state.add_flag(
                                 reason=(
@@ -359,7 +404,6 @@ class TriageAgent:
                                 "similarity_error": error_reason,
                             },
                         )
-                        # Annotate state — pipeline continues (no terminate())
                         if hasattr(state, "add_flag"):
                             state.add_flag(
                                 reason=(
@@ -380,8 +424,48 @@ class TriageAgent:
                                 "nearest_neighbor_tanimoto": nn_tanimoto,
                             },
                         )
+
                 # ═══════════════════════════════════════════════════════════════
-                # END WEEK 5 ADDITION
+                # WEEK 9 ADDITION: Post-run handling for PAINSTool
+                # Non-terminal — PAINS match generates advisory FLAG only.
+                # Never causes DISCARD or early termination.
+                # ═══════════════════════════════════════════════════════════════
+                elif tool_name == "PAINSTool":
+                    pains_data = (
+                        result.data if isinstance(result, ToolResult) else result
+                    )
+                    pains_alert = pains_data.get("pains_alert", False)
+                    pains_matches = pains_data.get("pains_matches", [])
+                    error_msg = pains_data.get("error_message")
+
+                    if error_msg:
+                        self.logger.warning(
+                            "PAINSTool error for %s: %s — pipeline continues",
+                            molecule_id,
+                            error_msg,
+                            extra={"molecule_id": molecule_id, "pains_error": error_msg},
+                        )
+                    elif pains_alert:
+                        pattern_summary = ", ".join(pains_matches[:3]) if pains_matches else "unknown pattern"
+                        self.logger.info(
+                            "Molecule %s PAINS alert: %s — advisory FLAG, pipeline continues",
+                            molecule_id,
+                            pattern_summary,
+                            extra={
+                                "molecule_id": molecule_id,
+                                "pains_matches": pains_matches,
+                            },
+                        )
+                        # Flag already added by PAINSTool.run() itself;
+                        # triage_agent logs but does not double-add.
+                    else:
+                        self.logger.info(
+                            "Molecule %s passed PAINS screen — no structural alerts",
+                            molecule_id,
+                            extra={"molecule_id": molecule_id},
+                        )
+                # ═══════════════════════════════════════════════════════════════
+                # END WEEK 9 ADDITION: PAINSTool
                 # ═══════════════════════════════════════════════════════════════
 
                 self.logger.info(

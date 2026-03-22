@@ -9,6 +9,12 @@ Week 8 changes:
   - RunRecord.save(): replaced JSONL body with DatabaseManager.save_run()
   - load_all() / load_as_dicts() / save() module-level functions unchanged
     (JSONL round-trip still works for legacy reads; new writes go to SQLite)
+
+Week 9 changes:
+  - RunRecord: added mol_weight, logp, tpsa, hbd, hba, rotatable_bonds,
+               scaffold_smiles, pains_alert, pains_matches fields
+  - RunRecordBuilder.build(): maps DescriptorTool and PAINSTool results
+    into the new fields so SQLite descriptor columns are populated
 """
 
 from __future__ import annotations
@@ -90,6 +96,8 @@ class RunRecord:
         Run metadata    — thresholds_preset, execution_time_ms, early_termination
         Week 8          — reward, s_sa, s_nov, s_qed, s_act, batch_id,
                           generation_number, entry_point
+        Week 9          — mol_weight, logp, tpsa, hbd, hba, rotatable_bonds,
+                          scaffold_smiles, pains_alert, pains_matches
     """
 
     # ── Run identity ────────────────────────────────────────────────────────
@@ -118,7 +126,7 @@ class RunRecord:
 
     # ── Similarity / IP risk ────────────────────────────────────────────────
     nn_tanimoto: Optional[float]         # nearest-neighbor Tanimoto (0.0 if none)
-    nn_source: Optional[str]             # "ChEMBL" | "PubChem" | None
+    nn_source: Optional[str]             # "ChEMBL" | "SureChEMBL" | None
     nn_id: Optional[str]
     nn_name: Optional[str]
     nn_smiles: Optional[str]
@@ -162,6 +170,19 @@ class RunRecord:
     batch_id: Optional[str] = None       # e.g. "gen_001"
     generation_number: Optional[int] = None
     entry_point: Optional[str] = None    # "cli" | "streamlit" | "mcp"
+
+    # ── Week 9: physicochemical descriptors ──────────────────────────────────
+    mol_weight: Optional[float] = None
+    logp: Optional[float] = None
+    tpsa: Optional[float] = None
+    hbd: Optional[int] = None
+    hba: Optional[int] = None
+    rotatable_bonds: Optional[int] = None
+    scaffold_smiles: Optional[str] = None
+
+    # ── Week 9: PAINS structural alerts ──────────────────────────────────────
+    pains_alert: Optional[bool] = None
+    pains_matches: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -245,8 +266,12 @@ class RunRecordBuilder:
             RunRecord ready for JSON serialisation and persistence.
         """
         validity = self._unwrap(state.tool_results.get("ValidityTool", {}))
-        sa = self._unwrap(state.tool_results.get("SAScoreTool", {}))
-        sim = self._unwrap(state.tool_results.get("SimilarityTool", {}))
+        sa       = self._unwrap(state.tool_results.get("SAScoreTool", {}))
+        sim      = self._unwrap(state.tool_results.get("SimilarityTool", {}))
+        # ── Week 9 ──────────────────────────────────────────────────────────
+        desc     = self._unwrap(state.tool_results.get("DescriptorTool", {}))
+        pains    = self._unwrap(state.tool_results.get("PAINSTool", {}))
+        # ────────────────────────────────────────────────────────────────────
 
         record = RunRecord(
             # ── Identity ────────────────────────────────────────────────
@@ -327,6 +352,21 @@ class RunRecordBuilder:
             batch_id=None,
             generation_number=None,
             entry_point=None,
+
+            # ── Week 9: physicochemical descriptors ──────────────────────
+            # desc is {} if DescriptorTool did not run — all fields stay None
+            mol_weight=desc.get("mol_weight"),
+            logp=desc.get("logp"),
+            tpsa=desc.get("tpsa"),
+            hbd=desc.get("hbd"),
+            hba=desc.get("hba"),
+            rotatable_bonds=desc.get("rotatable_bonds"),
+            scaffold_smiles=desc.get("scaffold_smiles"),
+
+            # ── Week 9: PAINS ─────────────────────────────────────────────
+            # pains is {} if PAINSTool did not run — fields stay None / []
+            pains_alert=pains.get("pains_alert"),
+            pains_matches=pains.get("pains_matches") or [],
         )
 
         # Week 8: compute reward and store all components on the record

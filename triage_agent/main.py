@@ -9,6 +9,9 @@ Week 6:   Full CLI with argparse. Accepts single SMILES or batch CSV.
 Week 8:   Added --batch-id and --generation-number CLI arguments.
           save_record() replaced with record.save() (SQLite via DatabaseManager).
           batch_id, generation_number, entry_point stamped onto record before save.
+Week 9:   DescriptorTool (position 2) and PAINSTool (position 5) added to
+          initialize_tools(). Both imported with graceful fallback so the CLI
+          continues to work if the tools are absent.
 
 Usage:
     # Single molecule
@@ -33,7 +36,7 @@ Usage:
     python main.py
 
 Author: TRI_FLAG Research Team
-Week: 8 (SQLite persistence, reward scoring, batch tracking)
+Week: 9 (DescriptorTool + PAINSTool registered in pipeline)
 """
 
 from __future__ import annotations
@@ -52,6 +55,19 @@ from tools.base_tool import Tool
 from tools.validity_tool import ValidityTool
 from tools.sa_score_tool import SAScoreTool
 from tools.similarity_tool import SimilarityTool
+
+# ── Week 9: new tools (graceful fallback if not yet written) ─────────────────
+try:
+    from tools.descriptor_tool import DescriptorTool
+    _DESCRIPTOR_TOOL_OK = True
+except ImportError:
+    _DESCRIPTOR_TOOL_OK = False
+
+try:
+    from tools.pains_tool import PAINSTool
+    _PAINS_TOOL_OK = True
+except ImportError:
+    _PAINS_TOOL_OK = False
 
 # ── Reporting layer ──────────────────────────────────────────────────────────
 from reporting.rationale_builder import RationaleBuilder, format_text
@@ -74,6 +90,13 @@ def initialize_tools(*, use_similarity: bool = True) -> List[Tool]:
     """
     Initialise the tool registry in required execution order.
 
+    Week 9 pipeline order:
+        1. ValidityTool   — chemical validity, early termination on failure
+        2. DescriptorTool — MW, logP, TPSA, HBD, HBA, rot. bonds, scaffold
+        3. SAScoreTool    — synthetic accessibility, early termination if SA > 7
+        4. SimilarityTool — IP / novelty screen (skipped if use_similarity=False)
+        5. PAINSTool      — structural alert screen, advisory FLAG only
+
     Args:
         use_similarity: If False, SimilarityTool is omitted. Useful for fast
                         offline runs where IP screening is not needed.
@@ -81,14 +104,24 @@ def initialize_tools(*, use_similarity: bool = True) -> List[Tool]:
     Returns:
         Ordered list of tools.
     """
-    tools: List[Tool] = [
-        ValidityTool(),
-        SAScoreTool(),
-    ]
+    tools: List[Tool] = [ValidityTool()]
+
+    if _DESCRIPTOR_TOOL_OK:
+        tools.append(DescriptorTool())
+    else:
+        logger.warning("DescriptorTool not available — descriptor columns will be NULL.")
+
+    tools.append(SAScoreTool())
+
     if use_similarity:
-        tools.append(SimilarityTool())
+        tools.append(SimilarityTool(flag_threshold=0.90))
     else:
         logger.info("SimilarityTool disabled (--no-similarity flag set).")
+
+    if _PAINS_TOOL_OK:
+        tools.append(PAINSTool())
+    else:
+        logger.warning("PAINSTool not available — PAINS screen will be skipped.")
 
     logger.info(
         "Tools initialised (%d): %s",

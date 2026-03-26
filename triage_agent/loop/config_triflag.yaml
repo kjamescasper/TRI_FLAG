@@ -1,0 +1,58 @@
+# loop/config_triflag.yaml
+#
+# ACEGEN Hydra configuration for TRI_FLAG integration.
+# Mirrors the structure of config_denovo.yaml — all required fields present.
+#
+# Launch via run_gen0.py (handles Windows DLL fixes):
+#   python run_gen0.py
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+experiment_name: triflag_gen000
+agent_name: reinvent
+log_dir: runs/acegen_logs
+logger_backend: null      # wandb, tensorboard, or null
+seed: 101
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+num_envs: 64              # molecules generated per RL step
+total_smiles: 4160        # 64 envs × 65 steps ≈ one generation pass
+
+# ---------------------------------------------------------------------------
+# Scoring — CRITICAL
+# ---------------------------------------------------------------------------
+# molscore_mode must be null to disable MolScore and use custom_task instead.
+# custom_task is the dotted Python path ACEGEN imports at training startup.
+# PYTHONPATH=. (set in run_gen0.py) ensures triage_agent resolves correctly.
+molscore_mode: null
+molscore_task: null
+custom_task: triage_agent.loop.triflag_scorer.triflag_score
+
+# ---------------------------------------------------------------------------
+# Prompt (constrained generation) — null = de novo, unconstrained
+# ---------------------------------------------------------------------------
+prompt: null
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: gru                # GRU pretrained on ChEMBL — fastest stable baseline
+custom_model_factory: null
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+lr: 0.0001
+eps: 1.0e-08
+weight_decay: 0.0
+
+# ---------------------------------------------------------------------------
+# REINVENT algorithm parameters
+# ---------------------------------------------------------------------------
+sigma: 120
+experience_replay: false
+replay_buffer_size: 100
+replay_batch_size: 10

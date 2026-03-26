@@ -845,6 +845,62 @@ with tab_analytics:
         unsafe_allow_html=True,
     )
 
+    # ------------------------------------------------------------------
+    # Loop Status panel — live stats queried directly from SQLite
+    # Added Week 10: current generation, total scored, mean reward
+    # ------------------------------------------------------------------
+    if os.path.exists(_DB_PATH):
+        try:
+            import sqlite3 as _sqlite3
+            _conn = _sqlite3.connect(_DB_PATH)
+            _row = _conn.execute(
+                "SELECT MAX(generation_number), COUNT(*), ROUND(AVG(reward), 4) FROM triage_runs"
+            ).fetchone()
+            _conn.close()
+            _cur_gen, _total_scored, _mean_reward = _row if _row else (None, 0, None)
+
+            st.markdown("#### Loop Status")
+            _ls1, _ls2, _ls3 = st.columns(3)
+            _ls1.metric("Current Generation", _cur_gen if _cur_gen is not None else "—")
+            _ls2.metric("Total Scored",        _total_scored or 0)
+            _ls3.metric("Mean Reward",          f"{_mean_reward:.4f}" if _mean_reward is not None else "—")
+            st.markdown("<hr class='section-rule'>", unsafe_allow_html=True)
+        except Exception as _e:
+            st.warning(f"Could not load loop status: {_e}")
+
+    # ------------------------------------------------------------------
+    # Top Candidates table — top 20 molecules by reward across all runs
+    # Added Week 10: queries DatabaseManager directly
+    # ------------------------------------------------------------------
+    if os.path.exists(_DB_PATH):
+        try:
+            import pandas as _pd
+            from database.db import DatabaseManager as _DatabaseManager
+            _db   = _DatabaseManager(_DB_PATH)
+            _top  = _db.get_top_n_by_reward(20)
+            if _top:
+                _top_rows = []
+                for _r in _top:
+                    _d = dict(_r)
+                    _top_rows.append({
+                        "molecule_id":    _d.get("molecule_id", "—"),
+                        "final_decision": _d.get("final_decision", "—"),
+                        "reward":         _d.get("reward"),
+                        "s_sa":           _d.get("s_sa"),
+                        "s_nov":          _d.get("s_nov"),
+                        "s_qed":          _d.get("s_qed"),
+                        "batch_id":       _d.get("batch_id", "—"),
+                    })
+                st.markdown("#### Top Candidates")
+                st.dataframe(
+                    _pd.DataFrame(_top_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("<hr class='section-rule'>", unsafe_allow_html=True)
+        except Exception as _e:
+            st.warning(f"Could not load top candidates: {_e}")
+
     if not os.path.exists(_DB_PATH):
         st.info(f"No database found at {_DB_PATH}. Run at least one molecule to initialise it.")
     else:

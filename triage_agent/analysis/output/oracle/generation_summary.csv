@@ -1,4 +1,5 @@
 batch_id,count,mean_reward,std_reward,pass_rate,flag_rate,discard_rate,unique_scaffolds,convergence_warning
+gen_000,4172,0.4346,0.1064,0.9545,0.0005,0.0451,3716,False
 gen_001,1,0.0,0.0,0.0,1.0,0.0,0,False
 smoke_test,3,0.4927,0.0028,1.0,0.0,0.0,2,True
 ungrouped,14,0.3468,0.1901,0.6429,0.3571,0.0,1,True

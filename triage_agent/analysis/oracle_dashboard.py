@@ -63,7 +63,7 @@ def _load_runs(
 
 
 def _group_by_generation(runs: List[Dict]) -> Dict[str, List[Dict]]:
-    """Group runs by batch_id (generation label). NULL batch_id → 'ungrouped'."""
+    """Group runs by batch_id. NULL batch_id → 'ungrouped'."""
     groups: Dict[str, List[Dict]] = defaultdict(list)
     for run in runs:
         key = run.get("batch_id") or "ungrouped"
@@ -81,6 +81,15 @@ def _generation_summary(
         decisions = [r.get("final_decision", "") for r in runs]
         scaffolds = [r.get("scaffold_smiles") for r in runs]
 
+        # Extract generation number from batch_id (e.g. "gen_000" → 0)
+        # Non-ACEGEN batches get generation_number = None
+        gen_num = None
+        if batch_id and batch_id.startswith("gen_"):
+            try:
+                gen_num = int(batch_id.split("_")[1])
+            except (IndexError, ValueError):
+                pass
+
         total = len(runs)
         diversity = compute_diversity(scaffolds)
         pass_count = decisions.count("PASS")
@@ -89,6 +98,7 @@ def _generation_summary(
 
         summaries.append({
             "batch_id": batch_id,
+            "generation_number": gen_num,
             "count": total,
             "mean_reward": round(sum(rewards) / len(rewards), 4) if rewards else 0.0,
             "std_reward": round(_std(rewards), 4) if len(rewards) > 1 else 0.0,
@@ -100,6 +110,16 @@ def _generation_summary(
             "rewards_raw": rewards,
         })
     return summaries
+
+
+def _acegen_summaries(summaries: List[Dict]) -> List[Dict]:
+    """
+    Return only real ACEGEN generation batches (batch_id matches gen_NNN),
+    sorted by generation number. Excludes smoke_test, ungrouped, and any
+    other non-generation batches from the time-series plots.
+    """
+    acegen = [s for s in summaries if s["generation_number"] is not None]
+    return sorted(acegen, key=lambda s: s["generation_number"])
 
 
 def _std(values: List[float]) -> float:
@@ -118,19 +138,18 @@ def _plot_reward_distribution(
     summaries: List[Dict],
     output_path: str,
 ) -> None:
-    """Box plot: reward distribution per generation."""
+    """Box plot: reward distribution per generation (all batches)."""
     fig, ax = plt.subplots(figsize=(10, 5))
     labels = [s["batch_id"] for s in summaries]
     data = [s["rewards_raw"] for s in summaries]
 
-    # Filter to generations with at least one reward
     filtered = [(l, d) for l, d in zip(labels, data) if d]
     if not filtered:
         plt.close(fig)
         return
     labels_f, data_f = zip(*filtered)
 
-    ax.boxplot(data_f, labels=labels_f, patch_artist=True,
+    ax.boxplot(data_f, tick_labels=labels_f, patch_artist=True,
                boxprops=dict(facecolor="#4C72B0", alpha=0.7))
     ax.set_title("Reward Distribution per Generation", fontsize=13, fontweight="bold")
     ax.set_xlabel("Generation (batch_id)")
@@ -146,11 +165,17 @@ def _plot_decision_rates(
     summaries: List[Dict],
     output_path: str,
 ) -> None:
-    """Stacked bar: PASS / FLAG / DISCARD rates per generation."""
-    labels = [s["batch_id"] for s in summaries]
-    pass_rates = [s["pass_rate"] for s in summaries]
-    flag_rates = [s["flag_rate"] for s in summaries]
-    discard_rates = [s["discard_rate"] for s in summaries]
+    """Stacked bar: PASS / FLAG / DISCARD rates — ACEGEN generations only,
+    sorted by generation number."""
+    acegen = _acegen_summaries(summaries)
+
+    # Fall back to all batches if no ACEGEN generations exist yet
+    plot_data = acegen if acegen else summaries
+
+    labels = [s["batch_id"] for s in plot_data]
+    pass_rates = [s["pass_rate"] for s in plot_data]
+    flag_rates = [s["flag_rate"] for s in plot_data]
+    discard_rates = [s["discard_rate"] for s in plot_data]
     x = range(len(labels))
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -165,6 +190,11 @@ def _plot_decision_rates(
     ax.set_ylabel("Fraction of batch")
     ax.set_ylim(0, 1.05)
     ax.legend(loc="upper right")
+
+    note = "" if acegen else "  (all batches — no ACEGEN generations yet)"
+    if note:
+        ax.set_xlabel(f"Generation (batch_id){note}", fontsize=9, color="#888888")
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -174,13 +204,28 @@ def _plot_mean_reward_trajectory(
     summaries: List[Dict],
     output_path: str,
 ) -> None:
-    """Line chart: mean reward trajectory across generations."""
-    labels = [s["batch_id"] for s in summaries]
-    means = [s["mean_reward"] for s in summaries]
-    stds = [s["std_reward"] for s in summaries]
-    x = list(range(len(labels)))
+    """Line chart: mean reward trajectory — ACEGEN generations only,
+    sorted by generation number. smoke_test and ungrouped are excluded
+    because they are not sequential training steps."""
+    acegen = _acegen_summaries(summaries)
 
     fig, ax = plt.subplots(figsize=(10, 4))
+
+    if not acegen:
+        ax.text(0.5, 0.5, "No ACEGEN generations recorded yet.\nRun Generation 0 to populate this chart.",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=11, color="#888888")
+        ax.set_title("Mean Reward Trajectory", fontsize=13, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return
+
+    labels = [s["batch_id"] for s in acegen]
+    means  = [s["mean_reward"] for s in acegen]
+    stds   = [s["std_reward"]  for s in acegen]
+    x = list(range(len(labels)))
+
     ax.plot(x, means, marker="o", linewidth=2, color="#4C72B0", label="Mean reward")
     ax.fill_between(
         x,
@@ -191,9 +236,17 @@ def _plot_mean_reward_trajectory(
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_title("Mean Reward Trajectory", fontsize=13, fontweight="bold")
+    ax.set_xlabel("ACEGEN generation")
     ax.set_ylabel("Mean Reward")
     ax.set_ylim(-0.05, 1.05)
     ax.legend()
+
+    if len(acegen) == 1:
+        ax.annotate("Run Generation 1 to see a trend",
+                    xy=(0, means[0]), xytext=(0.15, 0.75),
+                    textcoords="axes fraction", fontsize=9,
+                    color="#888888", arrowprops=dict(arrowstyle="->", color="#888888"))
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -203,23 +256,25 @@ def _plot_scaffold_diversity(
     summaries: List[Dict],
     output_path: str,
 ) -> None:
-    """Bar chart: unique scaffold count per generation."""
+    """Bar chart: unique scaffold count — all batches shown, but
+    mode collapse warning only meaningful for large batches (≥100 molecules)."""
     labels = [s["batch_id"] for s in summaries]
     unique = [s["unique_scaffolds"] for s in summaries]
     x = range(len(labels))
 
     fig, ax = plt.subplots(figsize=(10, 4))
     bars = ax.bar(x, unique, color="#9467bd", alpha=0.8)
-    # Convergence warning overlay
+
     for i, s in enumerate(summaries):
-        if s["convergence_warning"]:
+        # Only show mode collapse warning for batches large enough to be meaningful
+        if s["convergence_warning"] and s["count"] >= 100:
             bars[i].set_edgecolor("red")
             bars[i].set_linewidth(2.5)
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_title(
-        "Unique Scaffolds per Generation  (red border = mode collapse warning)",
+        "Unique Scaffolds per Generation  (red border = mode collapse warning, n≥100)",
         fontsize=12, fontweight="bold",
     )
     ax.set_ylabel("Unique scaffolds")

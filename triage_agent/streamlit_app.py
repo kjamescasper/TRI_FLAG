@@ -480,7 +480,7 @@ def _render_score_table(record: RunRecord):
             "Detail": f"Nearest: {record.nn_id or '—'} ({record.nn_source or '—'})  ·  {record.similarity_decision or '—'}",
         },
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 
 def _render_descriptor_table(state):
@@ -524,7 +524,7 @@ def _render_descriptor_table(state):
     ]
 
     st.markdown("#### Physicochemical Properties")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     if scaffold:
         st.markdown(
@@ -746,7 +746,7 @@ with tab_batch:
                 st.error(f"Missing required columns: {missing}")
             else:
                 st.markdown(f"{len(df_input)} molecules loaded.")
-                st.dataframe(df_input.head(5), use_container_width=True, hide_index=True)
+                st.dataframe(df_input.head(5), width='stretch', hide_index=True)
 
                 if st.button("Run Batch Triage", type="primary", key="run_batch"):
                     results = []
@@ -821,7 +821,7 @@ with tab_batch:
         m4.metric("Discard", discards)
         m5.metric("Error",   errors)
 
-        st.dataframe(df_res, use_container_width=True, hide_index=True)
+        st.dataframe(df_res, width='stretch', hide_index=True)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         col_dl1, col_dl2 = st.columns(2)
@@ -894,7 +894,7 @@ with tab_analytics:
                 st.markdown("#### Top Candidates")
                 st.dataframe(
                     _pd.DataFrame(_top_rows),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
                 st.markdown("<hr class='section-rule'>", unsafe_allow_html=True)
@@ -921,7 +921,7 @@ with tab_analytics:
                     "unique_scaffolds", "convergence_warning",
                 ]
                 df_summary = pd.DataFrame([{k: s[k] for k in display_cols if k in s} for s in summaries])
-                st.dataframe(df_summary, use_container_width=True, hide_index=True)
+                st.dataframe(df_summary, width='stretch', hide_index=True)
 
                 plot_dir = os.path.join(_HERE, "analysis", "output", "oracle")
                 plot_specs = [
@@ -959,7 +959,7 @@ with tab_analytics:
                     conn,
                 )
                 conn.close()
-                st.dataframe(df_raw, use_container_width=True, hide_index=True)
+                st.dataframe(df_raw, width='stretch', hide_index=True)
             except Exception as e:
                 st.error(f"Could not query database: {e}")
 

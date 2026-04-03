@@ -19,7 +19,7 @@ seed: 101
 # Environment
 # ---------------------------------------------------------------------------
 num_envs: 64              # molecules generated per RL step
-total_smiles: 4160        # 64 envs × 65 steps ≈ one generation pass
+total_smiles: 6400        # 64 envs × 100 steps ≈ 6-8 hours
 
 # ---------------------------------------------------------------------------
 # Scoring — CRITICAL

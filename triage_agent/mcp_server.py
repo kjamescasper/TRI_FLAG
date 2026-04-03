@@ -17,6 +17,9 @@ Tools exposed:
     search_by_scaffold(scaffold_smiles, limit?) -> molecules sharing a scaffold
     get_decision_breakdown(batch_id?) -> PASS/FLAG/DISCARD analysis with reward stats
     get_database_summary() -> high-level overview of everything in the DB
+    analyze_top_candidates(n?, batch_id?, min_reward?) -> top molecules with scientific interpretation
+    launch_generation(generation_number?) -> launch ACEGEN run as background process
+    get_generation_progress(generation_number?) -> live progress for a running generation
 """
 
 import logging
@@ -523,6 +526,10 @@ def get_database_summary() -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Tool 8 — analyze_top_candidates
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def analyze_top_candidates(
     n: int = 10,
@@ -619,7 +626,6 @@ def analyze_top_candidates(
         lines.append(f"   Decision: {decision}  |  Reward: {reward:.4f}")
         lines.append("")
 
-        # Score breakdown with plain-English interpretation
         lines.append("   Score Breakdown:")
         if s_sa is not None:
             sa_interp = (
@@ -647,7 +653,6 @@ def analyze_top_candidates(
             lines.append(f"     S_qed = {s_qed:.3f}  ({qed_interp})")
         lines.append("")
 
-        # Physicochemical properties with Lipinski assessment
         if any(v is not None for v in [mw, logp, tpsa, hbd, hba]):
             lines.append("   Physicochemical Properties:")
             if mw   is not None: lines.append(f"     MW:   {mw:.1f} Da  {'⚠ Ro5 violation (>500)' if mw > 500 else '✓ Ro5 compliant'}")
@@ -660,18 +665,16 @@ def analyze_top_candidates(
             if rotb is not None: lines.append(f"     RotB: {rotb}")
             lines.append("")
 
-        # IP / similarity flags
         if tanimoto is not None and tanimoto > 0:
             lines.append("   IP / Similarity:")
             lines.append(f"     Nearest neighbor: {nn_id or '?'} ({nn_source or '?'})")
             lines.append(f"     Tanimoto: {tanimoto:.3f}  " + (
                 "⚠ HIGH similarity — strong IP risk, review before advancing" if tanimoto >= 0.90 else
-                "moderate similarity — some IP overlap, conduct freedom-to-operate search" if tanimoto >= 0.70 else
+                "moderate similarity — conduct freedom-to-operate search" if tanimoto >= 0.70 else
                 "low similarity — likely novel territory"
             ))
             lines.append("")
 
-        # PAINS
         if pains is not None:
             if pains:
                 lines.append("   ⚠ PAINS ALERT — structural alerts detected")
@@ -681,28 +684,26 @@ def analyze_top_candidates(
                 lines.append("   ✓ No PAINS alerts")
                 lines.append("")
 
-        # Scaffold
         if scaffold:
             lines.append(f"   Scaffold: {scaffold}")
             lines.append("")
 
-        # Overall assessment
-        flags = []
+        flags_list = []
         if s_nov is not None and s_nov < 0.30:
-            flags.append("low novelty limits scientific value")
+            flags_list.append("low novelty limits scientific value")
         if s_sa is not None and s_sa < 0.40:
-            flags.append("difficult synthesis may block wet-lab follow-up")
+            flags_list.append("difficult synthesis may block wet-lab follow-up")
         if tanimoto is not None and tanimoto >= 0.90:
-            flags.append("IP similarity requires legal review")
+            flags_list.append("IP similarity requires legal review")
         if pains:
-            flags.append("PAINS alert requires orthogonal validation")
+            flags_list.append("PAINS alert requires orthogonal validation")
         if mw is not None and mw > 500:
-            flags.append("MW violates Lipinski Ro5")
+            flags_list.append("MW violates Lipinski Ro5")
         if tpsa is not None and tpsa > 90:
-            flags.append("TPSA may limit CNS penetration (relevant for BACE1)")
+            flags_list.append("TPSA may limit CNS penetration (relevant for BACE1)")
 
-        if flags:
-            lines.append(f"   ⚠ Flags: {' | '.join(flags)}")
+        if flags_list:
+            lines.append(f"   ⚠ Flags: {' | '.join(flags_list)}")
         else:
             lines.append("   ✓ No flags — strong candidate across all dimensions")
 
@@ -710,8 +711,7 @@ def analyze_top_candidates(
         lines.append("-" * 60)
         lines.append("")
 
-    # Summary statistics across the analyzed set
-    rewards = [r.get("reward") or 0 for r in filtered]
+    rewards  = [r.get("reward") or 0 for r in filtered]
     nov_vals = [r.get("s_nov") for r in filtered if r.get("s_nov") is not None]
     qed_vals = [r.get("s_qed") for r in filtered if r.get("s_qed") is not None]
 
@@ -724,6 +724,264 @@ def analyze_top_candidates(
         lines.append(f"  Mean S_qed:   {sum(qed_vals)/len(qed_vals):.3f}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool 9 — launch_generation
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def launch_generation(generation_number: int = None) -> str:
+    """
+    Launch an ACEGEN generation run as a background process.
+
+    If generation_number is omitted, auto-increments from the highest
+    generation already in the database. Checks EBI health before launching
+    and warns if ChEMBL/SureChEMBL are unavailable.
+
+    Returns the generation number, batch ID, and process PID so you can
+    track it with get_generation_progress().
+
+    Args:
+        generation_number: Generation to run (e.g. 3). Omit to auto-increment.
+    """
+    import sqlite3
+    import subprocess
+
+    # Resolve generation number
+    if generation_number is not None:
+        gen = generation_number
+    else:
+        try:
+            if os.path.exists(_DB_PATH):
+                conn = sqlite3.connect(_DB_PATH)
+                row = conn.execute(
+                    "SELECT MAX(generation_number) FROM triage_runs "
+                    "WHERE generation_number IS NOT NULL"
+                ).fetchone()
+                conn.close()
+                current_max = row[0] if (row and row[0] is not None) else -1
+                gen = current_max + 1
+            else:
+                gen = 0
+        except Exception as exc:
+            return f"Error reading database to auto-increment: {exc}"
+
+    batch_id = f"gen_{gen:03d}"
+
+    # Check if this generation already has data
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM triage_runs WHERE generation_number = ?", (gen,)
+        ).fetchone()[0]
+        conn.close()
+        if existing > 0:
+            return (
+                f"Generation {gen} already has {existing} molecules in the database.\n"
+                f"Use launch_generation(generation_number={gen + 1}) to start the next generation,\n"
+                f"or check get_generation_progress({gen}) to see its current state."
+            )
+    except Exception:
+        pass
+
+    # EBI health check
+    ebi_status = "UP"
+    try:
+        import requests as _req
+        r = _req.get("https://www.ebi.ac.uk/chembl/api/data/spore", timeout=10)
+        if r.status_code != 200:
+            ebi_status = "DOWN"
+    except Exception:
+        ebi_status = "DOWN"
+
+    # Locate run_generation.py
+    launcher = os.path.normpath(os.path.join(_HERE, "acegen_scripts", "run_generation.py"))
+    if not os.path.exists(launcher):
+        return (
+            f"run_generation.py not found at:\n  {launcher}\n"
+            f"Make sure it exists in triage_agent/acegen_scripts/"
+        )
+
+    # Ensure runs/ directory exists for log files
+    os.makedirs(os.path.join(_HERE, "runs"), exist_ok=True)
+
+    # Launch as detached subprocess so it outlives this MCP tool call
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, launcher, "--gen", str(gen)],
+            cwd=_HERE,
+            stdout=open(
+                os.path.join(_HERE, "runs", f"gen_{gen:03d}_stdout.log"), "w"
+            ),
+            stderr=open(
+                os.path.join(_HERE, "runs", f"gen_{gen:03d}_stderr.log"), "w"
+            ),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+        )
+    except Exception as exc:
+        return f"Failed to launch generation {gen}: {exc}"
+
+    lines = [
+        f"Generation {gen} launched successfully.",
+        f"  Batch ID:   {batch_id}",
+        f"  PID:        {proc.pid}",
+        f"  EBI status: {ebi_status}" + (
+            " — similarity screening active" if ebi_status == "UP"
+            else " — WARNING: IP screening will be skipped"
+        ),
+        f"  Stdout log: runs/gen_{gen:03d}_stdout.log",
+        f"  Stderr log: runs/gen_{gen:03d}_stderr.log",
+        f"",
+        f"Use get_generation_progress({gen}) to check progress.",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool 10 — get_generation_progress
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_generation_progress(generation_number: int = None) -> str:
+    """
+    Get live progress stats for a running or completed ACEGEN generation.
+
+    If generation_number is omitted, reports on the most recent generation
+    in the database. Shows molecules scored so far, estimated completion,
+    reward trajectory, and whether SureChEMBL is working.
+
+    Args:
+        generation_number: Generation to check (default: most recent).
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+
+        if generation_number is None:
+            row = conn.execute(
+                "SELECT MAX(generation_number) FROM triage_runs "
+                "WHERE generation_number IS NOT NULL"
+            ).fetchone()
+            if not row or row[0] is None:
+                conn.close()
+                return "No generation data found in the database yet."
+            gen = row[0]
+        else:
+            gen = generation_number
+
+        stats_row = conn.execute("""
+            SELECT
+                COUNT(*)                                                   AS total,
+                ROUND(AVG(reward), 4)                                      AS mean_reward,
+                ROUND(MAX(reward), 4)                                      AS max_reward,
+                SUM(CASE WHEN final_decision='PASS'    THEN 1 ELSE 0 END)  AS passes,
+                SUM(CASE WHEN final_decision='FLAG'    THEN 1 ELSE 0 END)  AS flags,
+                SUM(CASE WHEN final_decision='DISCARD' THEN 1 ELSE 0 END)  AS discards,
+                ROUND(AVG(sa_score), 3)                                    AS mean_sa,
+                ROUND(AVG(nn_tanimoto), 4)                                 AS mean_tanimoto,
+                MIN(triaged_at)                                            AS first_at,
+                MAX(triaged_at)                                            AS last_at,
+                batch_id
+            FROM triage_runs
+            WHERE generation_number = ?
+        """, (gen,)).fetchone()
+
+        sc_row = conn.execute("""
+            SELECT
+                SUM(CASE WHEN similarity_decision != 'ERROR'
+                              AND similarity_decision IS NOT NULL
+                         THEN 1 ELSE 0 END) AS sc_ok,
+                SUM(CASE WHEN similarity_decision = 'ERROR'
+                         THEN 1 ELSE 0 END) AS sc_err
+            FROM triage_runs
+            WHERE generation_number = ?
+        """, (gen,)).fetchone()
+
+        conn.close()
+    except Exception as exc:
+        return f"Error querying database: {exc}"
+
+    if not stats_row or stats_row[0] == 0:
+        return f"No data found for generation {gen} yet."
+
+    total, mean_r, max_r, passes, flags, discards, mean_sa, mean_tan, first_at, last_at, batch_id = stats_row
+    sc_ok  = sc_row[0] or 0 if sc_row else 0
+    sc_err = sc_row[1] or 0 if sc_row else 0
+
+    pass_pct    = passes    / total * 100 if total else 0
+    flag_pct    = flags     / total * 100 if total else 0
+    discard_pct = discards  / total * 100 if total else 0
+
+    _TARGET_MOLECULES = 4160
+    eta_str  = "unknown"
+    rate_str = "unknown"
+
+    try:
+        if first_at and last_at and total > 1:
+            from datetime import datetime
+            t0 = datetime.strptime(first_at[:16],  "%Y-%m-%d %H:%M")
+            t1 = datetime.strptime(last_at[:16],   "%Y-%m-%d %H:%M")
+            elapsed_sec = (t1 - t0).total_seconds()
+            if elapsed_sec > 0:
+                rate = total / elapsed_sec
+                rate_str = f"{rate * 60:.1f} mol/min"
+                remaining = _TARGET_MOLECULES - total
+                if remaining > 0:
+                    eta_sec = remaining / rate
+                    eta_min = int(eta_sec / 60)
+                    eta_hr  = eta_min // 60
+                    eta_min_rem = eta_min % 60
+                    eta_str = f"~{eta_hr}h {eta_min_rem}m" if eta_hr > 0 else f"~{eta_min}m"
+                else:
+                    eta_str = "complete"
+    except Exception:
+        pass
+
+    pct_done = min(total / _TARGET_MOLECULES * 100, 100)
+    filled   = int(pct_done / 5)
+    bar      = "█" * filled + "░" * (20 - filled)
+
+    sc_status = (
+        "✓ Working" if sc_err == 0 and sc_ok > 0 else
+        f"⚠ {sc_err} ERROR decisions (EBI may be unstable)" if sc_err > 0 else
+        "— no similarity data yet"
+    )
+
+    lines = [
+        f"Generation {gen} Progress  ({batch_id or '?'})",
+        f"",
+        f"  [{bar}] {pct_done:.1f}%",
+        f"  {total:,} / {_TARGET_MOLECULES:,} molecules scored",
+        f"  Rate: {rate_str}  |  ETA: {eta_str}",
+        f"",
+        f"  Reward:   mean={mean_r or 0:.4f}   max={max_r or 0:.4f}",
+        f"  PASS:     {passes} ({pass_pct:.1f}%)",
+        f"  FLAG:     {flags} ({flag_pct:.1f}%)",
+        f"  DISCARD:  {discards} ({discard_pct:.1f}%)",
+    ]
+    if mean_sa is not None:
+        lines.append(f"  Mean SA:  {mean_sa:.3f}")
+    if mean_tan is not None:
+        lines.append(f"  Mean Tan: {mean_tan:.4f}  (lower = more novel)")
+    lines += [
+        f"",
+        f"  SureChEMBL: {sc_status}",
+    ]
+
+    if pct_done >= 100:
+        lines.append(f"\n  ✓ Generation {gen} complete.")
+    else:
+        lines.append(f"\n  Run get_generation_progress({gen}) again to refresh.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     # Restore real stdout now that all imports are done.
     # From this point forward stdout belongs exclusively to the MCP JSON-RPC transport.

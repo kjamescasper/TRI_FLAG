@@ -16,6 +16,7 @@ HBD, HBA, rotatable_bonds, scaffold_smiles, pains_alert, predicted_affinity,
 target_id) are reserved here and populated in Weeks 9–11 without migration.
 
 Week 8 — do not modify column layout; extend by adding nullable columns only.
+Week 11 — target_predictions table activated (was stub); affinity index added.
 """
 
 # ===========================================================================
@@ -92,7 +93,7 @@ CREATE TABLE IF NOT EXISTS triage_runs (
     -- Week 9 PAINS column (nullable until PAINSTool added)
     pains_alert         INTEGER,
 
-    -- Week 11 target-binding columns (nullable until DeepPurpose added)
+    -- Week 11 target-binding columns (populated by DeepPurpose)
     predicted_affinity  REAL,
     target_id           TEXT,
 
@@ -121,7 +122,7 @@ CREATE TABLE IF NOT EXISTS batches (
 """
 
 # ===========================================================================
-# target_predictions table — Week 11 (stub reserved here, activated Week 11)
+# target_predictions table — Week 11 (activated from stub)
 # Biolink class: biolink:ChemicalToTargetAssociation
 # ===========================================================================
 
@@ -147,6 +148,11 @@ CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_runs_decision   ON triage_runs(final_decision);",
     "CREATE INDEX IF NOT EXISTS idx_runs_reward     ON triage_runs(reward);",
     "CREATE INDEX IF NOT EXISTS idx_runs_generation ON triage_runs(generation_number);",
+    # Week 11: index on predicted_affinity for get_top_n_by_affinity() queries
+    "CREATE INDEX IF NOT EXISTS idx_runs_affinity   ON triage_runs(predicted_affinity);",
+    # Week 11: index on target_predictions for per-target lookups
+    "CREATE INDEX IF NOT EXISTS idx_tp_molecule     ON target_predictions(molecule_id);",
+    "CREATE INDEX IF NOT EXISTS idx_tp_target       ON target_predictions(target_id);",
 ]
 
 # ===========================================================================

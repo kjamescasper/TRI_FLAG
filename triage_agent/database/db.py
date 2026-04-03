@@ -415,6 +415,65 @@ class DatabaseManager:
         logger.debug("get_top_n_by_reward(n=%d, batch=%s): %d rows", n, batch_id, len(rows))
         return rows
 
+    def get_top_n_by_affinity(
+        self,
+        n: int,
+        target_id: Optional[str] = None,
+    ) -> List[sqlite3.Row]:
+        """
+        Return top-N runs ranked by predicted_affinity DESC.
+
+        Week 11 addition. Used by the Streamlit shortlist tab and MCP
+        get_shortlist() to surface the highest-affinity candidates.
+
+        Parameters
+        ----------
+        n : int
+            Maximum number of rows to return.
+        target_id : str | None
+            If provided, filter to runs where target_id matches.
+            If None, returns top-N across all targets.
+
+        Returns
+        -------
+        list of sqlite3.Row
+            Rows from triage_runs joined with molecules, ordered by
+            predicted_affinity DESC. Rows with NULL predicted_affinity
+            are excluded.
+        """
+        conn = self._conn()
+        if target_id is not None:
+            cursor = conn.execute(
+                f"""
+                SELECT tr.*, m.{COL_CANONICAL_SMILES}
+                FROM triage_runs tr
+                JOIN molecules m USING ({COL_MOLECULE_ID})
+                WHERE tr.{COL_PREDICTED_AFFINITY} IS NOT NULL
+                  AND tr.{COL_TARGET_ID} = ?
+                ORDER BY tr.{COL_PREDICTED_AFFINITY} DESC
+                LIMIT ?
+                """,
+                (target_id, n),
+            )
+        else:
+            cursor = conn.execute(
+                f"""
+                SELECT tr.*, m.{COL_CANONICAL_SMILES}
+                FROM triage_runs tr
+                JOIN molecules m USING ({COL_MOLECULE_ID})
+                WHERE tr.{COL_PREDICTED_AFFINITY} IS NOT NULL
+                ORDER BY tr.{COL_PREDICTED_AFFINITY} DESC
+                LIMIT ?
+                """,
+                (n,),
+            )
+        rows = cursor.fetchall()
+        logger.debug(
+            "get_top_n_by_affinity(n=%d, target=%s): %d rows",
+            n, target_id, len(rows),
+        )
+        return rows
+
     def get_all_runs(
         self,
         limit: Optional[int] = None,

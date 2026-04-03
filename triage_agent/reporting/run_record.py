@@ -15,6 +15,10 @@ Week 9 changes:
                scaffold_smiles, pains_alert, pains_matches fields
   - RunRecordBuilder.build(): maps DescriptorTool and PAINSTool results
     into the new fields so SQLite descriptor columns are populated
+
+Week 11 changes:
+  - RunRecordBuilder.build(): maps RewardResult.s_act onto record.s_act
+    so the DeepPurpose binding component is persisted to SQLite.
 """
 
 from __future__ import annotations
@@ -369,13 +373,15 @@ class RunRecordBuilder:
             pains_matches=pains.get("pains_matches") or [],
         )
 
-        # Week 8: compute reward and store all components on the record
+        # Week 8: compute reward and store all components on the record.
+        # Week 11: reward_result.s_act is now populated by compute_reward()
+        #          when DeepPurpose is available; defaults to 1.0 otherwise.
         reward_result = compute_reward(record)
         record.reward = reward_result.reward
         record.s_sa   = reward_result.s_sa
         record.s_nov  = reward_result.s_nov
         record.s_qed  = reward_result.s_qed
-        # record.s_act stays None until Week 11 (DeepPurpose)
+        record.s_act  = reward_result.s_act  # Week 11: map S_act onto record
 
         return record
 

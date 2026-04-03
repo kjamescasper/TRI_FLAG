@@ -9,7 +9,7 @@ Queries three public cheminformatics databases at runtime:
     chemistry. A hit here means structural similarity to a known drug or
     clinical candidate — the strongest IP concern.
 
-  - SureChEMBL (~20M compounds): structures extracted directly from patent
+  - SureChEMBL (~28M compounds): structures extracted directly from patent
     literature by the EBI. A hit here means the scaffold appears in a filed
     patent. This is the scientifically correct source for IP-risk screening
     in a drug discovery context.
@@ -41,6 +41,12 @@ Performance note:
   Live API calls add ~3–15s per molecule depending on network and server
   load. Use --no-similarity for fast offline development runs.
 
+SureChEMBL API note (updated Week 11):
+  The old /api/search/similarity endpoint was removed in the 2024 rebuild.
+  The new API is async: POST /search/structure → poll /search/{hash}/status
+  → GET /search/{hash}/results. The similarity threshold is applied
+  client-side after fetching results.
+
 Literature:
   Maggiora G et al. (2014). J. Med. Chem. 57(8), 3186-3204.
     DOI: 10.1021/jm401411z — ECFP4 Tanimoto is standard for IP-risk.
@@ -48,6 +54,7 @@ Literature:
     DOI: 10.1039/b409813g — 0.85 threshold minimizes false positives.
 
 Week: 9 (SureChEMBL added; PubChem demoted to informational)
+Week: 11 (SureChEMBL updated to new 2024 async API)
 """
 
 import logging
@@ -95,7 +102,7 @@ except ImportError:
 # API constants
 # ---------------------------------------------------------------------------
 _CHEMBL_BASE_URL     = "https://www.ebi.ac.uk/chembl/api/data"
-_SURECHEMBL_BASE_URL = "https://www.surechembl.org/api/search"
+_SURECHEMBL_BASE_URL = "https://www.surechembl.org/api"   # updated: new 2024 API base
 _PUBCHEM_BASE_URL    = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
 _FINGERPRINT_METHOD = "Morgan_ECFP4_r2_2048bits"
@@ -107,7 +114,7 @@ class SimilarityTool(Tool):
 
     FLAG sources (drive the decision):
         ChEMBL    — approved drugs and bioactive compounds (~2.4M)
-        SureChEMBL — compounds extracted from patent literature (~20M)
+        SureChEMBL — compounds extracted from patent literature (~28M)
 
     Informational source (stored, never flags):
         PubChem   — all publicly known structures (~115M)
@@ -152,7 +159,7 @@ class SimilarityTool(Tool):
         use_surechembl: bool = True,
         use_pubchem: bool = True,
         chembl_timeout: float = 10.0,
-        surechembl_timeout: float = 10.0,
+        surechembl_timeout: float = 15.0,   # increased: new API needs poll time
         pubchem_timeout: float = 15.0,
         max_results_per_api: int = 5,
     ):
@@ -166,7 +173,8 @@ class SimilarityTool(Tool):
             use_surechembl:    Query SureChEMBL (flagging source).
             use_pubchem:       Query PubChem (informational only — never flags).
             chembl_timeout:    Seconds before ChEMBL request times out.
-            surechembl_timeout: Seconds before SureChEMBL request times out.
+            surechembl_timeout: Max seconds for SureChEMBL async flow
+                               (submit + poll + fetch). Default 15.
             pubchem_timeout:   Seconds total for PubChem async polling.
             max_results_per_api: Maximum hits to retrieve from each API.
         """
@@ -469,22 +477,32 @@ class SimilarityTool(Tool):
 
     # =========================================================================
     # SureChEMBL API  (flagging source — patent literature)
+    # Updated Week 11: new 2024 async API replaces old /search/similarity GET
     # =========================================================================
 
     def _query_surechembl(
         self, smiles: str, molecule_id: str
     ) -> Tuple[List[dict], bool]:
         """
-        Query the SureChEMBL similarity API.
+        Query the SureChEMBL similarity API (new 2024 async API).
 
-        SureChEMBL contains ~20M structures extracted directly from patent
-        text by the EBI. A hit here indicates the scaffold appears in a
-        filed patent — the primary IP-risk signal for drug discovery.
+        The old synchronous GET /api/search/similarity endpoint was removed
+        in the 2024 SureChEMBL rebuild. The new flow is:
 
-        Endpoint: GET /similarity?smiles=<SMILES>&threshold=<0-1>&limit=<n>
+            1. POST /search/structure
+               Body: {"StructureSearchRequest": {"struct": smiles,
+                      "structSearchType": "similarity", "maxResults": N}}
+               Response: {"data": {"hash": "<uuid>"}}
 
-        Returns Tanimoto scores as floats in [0, 1]. Results are returned
-        synchronously (no async polling required).
+            2. Poll GET /search/{hash}/status
+               until data.message contains "finished"
+
+            3. GET /search/{hash}/results?page=0&max_results=N
+               Response: data.results.structures (list of compound dicts)
+               Each dict has "similarity" (string float in [0,1])
+
+        Threshold filtering is applied client-side — the server returns all
+        similarity results; we keep only hits >= flag_threshold.
 
         Args:
             smiles:      Canonical SMILES string.
@@ -494,34 +512,90 @@ class SimilarityTool(Tool):
             (hits, available)
         """
         try:
-            encoded_smiles = urllib.parse.quote(smiles, safe="")
-            url = (
-                f"{_SURECHEMBL_BASE_URL}/similarity"
-                f"?smiles={encoded_smiles}"
-                f"&threshold={self.flag_threshold:.2f}"
-                f"&limit={self.max_results_per_api}"
+            # ── Step 1: submit search ───────────────────────────────────────
+            submit_resp = _requests.post(
+                f"{_SURECHEMBL_BASE_URL}/search/structure",
+                json={
+                    "StructureSearchRequest": {
+                        "struct":           smiles,
+                        "structSearchType": "similarity",
+                        # Request more than needed so client-side threshold
+                        # filtering has enough candidates to work with
+                        "maxResults":       self.max_results_per_api * 20,
+                    }
+                },
+                timeout=self.surechembl_timeout,
+            )
+            submit_resp.raise_for_status()
+            search_hash = submit_resp.json().get("data", {}).get("hash")
+
+            if not search_hash:
+                logger.warning(
+                    "SimilarityTool [%s]: SureChEMBL returned no hash",
+                    molecule_id,
+                )
+                return [], False
+
+            # ── Step 2: poll until finished ─────────────────────────────────
+            status_url = f"{_SURECHEMBL_BASE_URL}/search/{search_hash}/status"
+            max_polls  = int(self.surechembl_timeout)  # 1 poll per second
+            finished   = False
+
+            for _ in range(max_polls):
+                time.sleep(1.0)
+                try:
+                    st = _requests.get(status_url, timeout=self.surechembl_timeout)
+                    st.raise_for_status()
+                    msg = st.json().get("data", {}).get("message", "")
+                    if "finished" in msg.lower():
+                        finished = True
+                        break
+                except Exception:
+                    continue
+
+            if not finished:
+                logger.warning(
+                    "SimilarityTool [%s]: SureChEMBL search did not finish "
+                    "within %d seconds",
+                    molecule_id, max_polls,
+                )
+                return [], False
+
+            # ── Step 3: fetch results ───────────────────────────────────────
+            results_resp = _requests.get(
+                f"{_SURECHEMBL_BASE_URL}/search/{search_hash}/results",
+                params={"page": 0, "max_results": self.max_results_per_api * 20},
+                timeout=self.surechembl_timeout,
+            )
+            results_resp.raise_for_status()
+            structures = (
+                results_resp.json()
+                .get("data", {})
+                .get("results", {})
+                .get("structures", [])
             )
 
-            resp = _requests.get(url, timeout=self.surechembl_timeout)
-            resp.raise_for_status()
-
-            data = resp.json()
-            # SureChEMBL returns: {"results": [{"surechembl_id": ...,
-            #   "smiles": ..., "similarity": 0.92, "patent_ids": [...]}, ...]}
-            results = data.get("results", [])
-
+            # ── Step 4: client-side threshold filter ────────────────────────
             hits = []
-            for r in results[:self.max_results_per_api]:
-                patent_ids = r.get("patent_ids", [])
-                patent_label = patent_ids[0] if patent_ids else r.get("surechembl_id", "")
+            for s in structures:
+                try:
+                    tanimoto = float(s.get("similarity", 0.0))
+                except (TypeError, ValueError):
+                    continue
+
+                if tanimoto < self.flag_threshold:
+                    continue
+
                 hits.append({
                     "source":   "SureChEMBL",
-                    "id":       r.get("surechembl_id", ""),
-                    "name":     patent_label,
-                    "tanimoto": float(r.get("similarity", 0.0)),
-                    "smiles":   r.get("smiles", ""),
-                    "patent_ids": patent_ids,
+                    "id":       str(s.get("chemical_id", s.get("id", ""))),
+                    "name":     s.get("name") or str(s.get("chemical_id", "")),
+                    "tanimoto": tanimoto,
+                    "smiles":   s.get("smiles", ""),
                 })
+
+                if len(hits) >= self.max_results_per_api:
+                    break
 
             logger.debug(
                 "SimilarityTool [%s]: SureChEMBL returned %d hits above %.2f",

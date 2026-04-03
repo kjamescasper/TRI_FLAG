@@ -1,5 +1,8 @@
 batch_id,count,mean_reward,std_reward,pass_rate,flag_rate,discard_rate,unique_scaffolds,convergence_warning
 gen_000,4172,0.4346,0.1064,0.9545,0.0005,0.0451,3716,False
-gen_001,1,0.0,0.0,0.0,1.0,0.0,0,False
+gen_001,4018,0.1094,0.1009,0.934,0.0172,0.0488,3527,False
+gen_002,1530,0.0778,0.0902,0.9033,0.0444,0.0523,1175,False
+gen_003,1283,0.0792,0.0907,0.9088,0.0359,0.0553,1175,False
+gen_004,2420,0.094,0.0996,0.907,0.0335,0.0595,2181,False
 smoke_test,3,0.4927,0.0028,1.0,0.0,0.0,2,True
 ungrouped,14,0.3468,0.1901,0.6429,0.3571,0.0,1,True

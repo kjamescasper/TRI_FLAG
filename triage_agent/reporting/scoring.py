@@ -18,10 +18,12 @@ Formula (Week 8):
                                                 full reward <0.70)
     S_qed — RDKit QED drug-likeness            (practical ceiling ~0.75)
 
-Week 11 extension: S_act (DeepPurpose predicted pIC50) will be imported from
-target/deeppurpose_model.py and multiplied in. When that module is absent,
-S_act defaults to 1.0 and the formula degrades cleanly to this three-component
-version — no changes required here.
+Formula (Week 11):
+    reward = S_sa × S_nov × S_qed × S_act
+
+    S_act — normalised predicted pIC50 from DeepPurpose for BACE1.
+            Defaults to 1.0 when DeepPurpose is not configured — formula
+            degrades cleanly to the three-component Week 8 version.
 
 Usage:
     from reporting.scoring import compute_reward
@@ -30,6 +32,7 @@ Usage:
     record.s_sa   = result.s_sa
     record.s_nov  = result.s_nov
     record.s_qed  = result.s_qed
+    record.s_act  = result.s_act
 """
 
 from __future__ import annotations
@@ -40,6 +43,52 @@ from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Week 11: attempt to import DeepPurpose target binding module.
+# If the target package is absent (e.g. clean install without Week 11 files),
+# _DEEPPURPOSE_AVAILABLE is False and S_act defaults to 1.0 in compute_reward().
+# This ensures the formula degrades cleanly to the three-component version
+# with zero performance overhead — no try/except in the hot path.
+# ---------------------------------------------------------------------------
+
+_DEEPPURPOSE_AVAILABLE: bool = False
+predict_binding = None   # type: ignore[assignment]
+normalise_affinity = None  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# S_act is gated by an explicit env var for two reasons:
+#
+# 1. Safety: torch fires a fatal C-level abort (0xc0000139, shm.dll) on
+#    Windows when imported outside the acegen_scripts/run_gen0.py launcher
+#    that patches the DLL search path.  A Python except clause cannot catch
+#    a process-level abort, so we must never import DeepPurpose/torch at
+#    module load time in normal pytest runs.
+#
+# 2. Performance: DeepPurpose model loading takes 5-10 seconds and should
+#    only happen when ACEGEN is actually running.
+#
+# Set TRIFLAG_ENABLE_DEEPPURPOSE=1 in the environment (done automatically
+# by acegen_scripts/run_gen0.py) to activate S_act.
+# ---------------------------------------------------------------------------
+import os as _os
+if _os.environ.get("TRIFLAG_ENABLE_DEEPPURPOSE", "0") == "1":
+    try:
+        from target.deeppurpose_model import (  # type: ignore[import]
+            normalise_affinity,
+            predict_binding,
+        )
+        _DEEPPURPOSE_AVAILABLE = True
+        logger.debug("DeepPurpose target binding module loaded — S_act active.")
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "target.deeppurpose_model failed to load — S_act will default to 1.0."
+        )
+else:
+    logger.debug(
+        "TRIFLAG_ENABLE_DEEPPURPOSE not set — S_act disabled, "
+        "formula degrades to three-component Week 10 version."
+    )
 
 # ---------------------------------------------------------------------------
 # Tunable constants — centralised so tests can override and Week 9+ can tweak
@@ -67,7 +116,6 @@ class RewardResult:
     Structured output of compute_reward().
 
     All four components are stored in SQLite for dashboard decomposition.
-    s_act is None at Week 8 (DeepPurpose not yet integrated).
 
     Attributes
     ----------
@@ -79,15 +127,16 @@ class RewardResult:
         Two-zone novelty component.
     s_qed : float
         RDKit QED drug-likeness component.
-    s_act : float | None
-        Target-binding component (Week 11). None until DeepPurpose added.
+    s_act : float
+        Target-binding component (Week 11). Defaults to 1.0 when DeepPurpose
+        is unavailable so the multiplicative formula is unaffected.
     """
 
     reward: float
     s_sa: float
     s_nov: float
     s_qed: float
-    s_act: Optional[float] = None
+    s_act: float = 1.0
 
     def to_dict(self) -> dict:
         return {
@@ -194,11 +243,15 @@ def compute_s_qed(smiles: Optional[str]) -> float:
 
 def compute_reward(record) -> RewardResult:
     """
-    Compute the multiplicative three-component reward for a RunRecord.
+    Compute the multiplicative four-component reward for a RunRecord.
 
     Returns RewardResult(reward=0.0, ...) immediately for:
       - invalid molecules (is_valid is False)
       - DISCARD decisions
+
+    Week 11: S_act (DeepPurpose predicted pIC50) is multiplied in when
+    target.deeppurpose_model is available. When absent, S_act=1.0 and the
+    formula is identical to the three-component Week 8 version.
 
     Parameters
     ----------
@@ -209,11 +262,11 @@ def compute_reward(record) -> RewardResult:
     # --- Guard: invalid or discarded molecules get zero reward ---
     if not getattr(record, "is_valid", False):
         logger.debug("reward=0.0 — molecule is invalid")
-        return RewardResult(reward=0.0, s_sa=0.0, s_nov=0.0, s_qed=0.0)
+        return RewardResult(reward=0.0, s_sa=0.0, s_nov=0.0, s_qed=0.0, s_act=1.0)
 
     if getattr(record, "final_decision", None) == "DISCARD":
         logger.debug("reward=0.0 — final_decision=DISCARD")
-        return RewardResult(reward=0.0, s_sa=0.0, s_nov=0.0, s_qed=0.0)
+        return RewardResult(reward=0.0, s_sa=0.0, s_nov=0.0, s_qed=0.0, s_act=1.0)
 
     # --- Compute components ---
     sa_score = getattr(record, "sa_score", None)
@@ -226,20 +279,40 @@ def compute_reward(record) -> RewardResult:
     nn_tanimoto = getattr(record, "nn_tanimoto", None)
     s_nov = compute_s_nov(nn_tanimoto)
 
-    smiles = getattr(record, "canonical_smiles", None) or getattr(record, "smiles", None)
+    smiles = (
+        getattr(record, "smiles_canonical", None)
+        or getattr(record, "canonical_smiles", None)
+        or getattr(record, "smiles", None)
+    )
     s_qed = compute_s_qed(smiles)
 
-    # --- Multiplicative combination ---
-    reward = s_sa * s_nov * s_qed
+    # --- Week 11: S_act (DeepPurpose binding affinity) ---
+    s_act: float = 1.0  # neutral default — preserves three-component formula
+    if _DEEPPURPOSE_AVAILABLE and predict_binding is not None and normalise_affinity is not None:
+        try:
+            raw_pic50 = predict_binding(smiles or "")
+            s_act = normalise_affinity(raw_pic50)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "S_act computation failed for SMILES %r: %s — defaulting to 1.0",
+                (smiles or "")[:60],
+                exc,
+            )
+            s_act = 1.0
+
+    # --- Multiplicative combination (four components) ---
+    reward = s_sa * s_nov * s_qed * s_act
 
     logger.debug(
-        "reward=%.4f  s_sa=%.4f  s_nov=%.4f  s_qed=%.4f  (sa=%.2f, tanimoto=%s)",
+        "reward=%.4f  s_sa=%.4f  s_nov=%.4f  s_qed=%.4f  s_act=%.4f"
+        "  (sa=%.2f, tanimoto=%s)",
         reward,
         s_sa,
         s_nov,
         s_qed,
+        s_act,
         sa_score if sa_score is not None else -1,
         f"{nn_tanimoto:.3f}" if nn_tanimoto is not None else "None",
     )
 
-    return RewardResult(reward=reward, s_sa=s_sa, s_nov=s_nov, s_qed=s_qed)
+    return RewardResult(reward=reward, s_sa=s_sa, s_nov=s_nov, s_qed=s_qed, s_act=s_act)

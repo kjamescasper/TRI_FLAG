@@ -15,10 +15,13 @@ Interface contract (CRITICAL — violations silently kill ACEGEN training):
   - The function itself must never raise — all exceptions caught internally
 
 Module-level configuration (set before each generation run):
-  BATCH_ID           str | None  — ACEGEN batch identifier (e.g. "gen_001")
-  GENERATION_NUMBER  int | None  — generation counter for oracle tracking
-  SKIP_SIMILARITY    bool        — True for generation 0 (no live API calls)
-  DB_PATH            str         — path to the SQLite database file
+  BATCH_ID            str | None  — ACEGEN batch identifier (e.g. "gen_001")
+  GENERATION_NUMBER   int | None  — generation counter for oracle tracking
+  SKIP_SIMILARITY     bool        — True for generation 0 (no live API calls)
+  DB_PATH             str         — path to the SQLite database file
+  ENABLE_DEEPPURPOSE  bool        — True (default) to include S_act in reward.
+                                    False → S_act=1.0, exactly Week 10 behaviour,
+                                    zero performance overhead from DeepPurpose.
 
 Active pipeline (5 tools):
     ValidityTool → DescriptorTool → SAScoreTool → SimilarityTool* → PAINSTool
@@ -27,8 +30,26 @@ Active pipeline (5 tools):
 
 from __future__ import annotations
 
-import logging
+# ---------------------------------------------------------------------------
+# CRITICAL: set TRIFLAG_ENABLE_DEEPPURPOSE in os.environ BEFORE any other
+# import fires.  reporting.scoring reads this env var at module import time
+# to decide whether to import DeepPurpose/torch.  If it's already imported
+# (cached in sys.modules) from a previous import, the env var has no effect
+# — but in normal usage this module is the first importer so the order matters.
+# ---------------------------------------------------------------------------
 import os
+
+_dp_env = os.environ.get("TRIFLAG_ENABLE_DEEPPURPOSE", "1")
+# Normalise: anything other than "0" means enabled
+if _dp_env == "0":
+    os.environ["TRIFLAG_ENABLE_DEEPPURPOSE"] = "0"
+else:
+    os.environ["TRIFLAG_ENABLE_DEEPPURPOSE"] = "1"
+
+# ---------------------------------------------------------------------------
+# All other imports come AFTER the env var is set
+# ---------------------------------------------------------------------------
+import logging
 import uuid
 from typing import List, Optional
 
@@ -58,6 +79,10 @@ BATCH_ID: Optional[str] = os.environ.get("TRIFLAG_BATCH_ID", None)
 GENERATION_NUMBER: Optional[int] = int(os.environ["TRIFLAG_GENERATION_NUMBER"]) if "TRIFLAG_GENERATION_NUMBER" in os.environ else None
 SKIP_SIMILARITY: bool = os.environ.get("TRIFLAG_SKIP_SIMILARITY", "0") == "1"
 DB_PATH: str = os.environ.get("TRIFLAG_DB_PATH", "runs/triflag.db")
+
+# Week 11: whether S_act (DeepPurpose binding affinity) is included in reward.
+# Reads the same env var that was set above before the reporting imports.
+ENABLE_DEEPPURPOSE: bool = os.environ.get("TRIFLAG_ENABLE_DEEPPURPOSE", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -115,32 +140,22 @@ def _score_one(
     returns 0.0. This function is deliberately not exposed as a public API —
     it exists only to keep triflag_score() readable.
     """
-    # Generate a short deterministic-looking ID for this molecule.
-    # Using a UUID fragment keeps IDs unique across ACEGEN batches.
     molecule_id = f"acegen_{uuid.uuid4().hex[:12]}"
 
     state = agent.run(molecule_id=molecule_id, raw_input=smiles)
     explanation = rationale_builder.build(state)
     record = record_builder.build(state, explanation)
 
-    # Stamp with generation metadata — these fields are already in the
-    # RunRecord dataclass from Week 8.
     record.batch_id = BATCH_ID
     record.generation_number = GENERATION_NUMBER
     record.entry_point = "acegen"
 
-    # Persist to SQLite.  save() internally calls DatabaseManager.save_run().
     record.save(DB_PATH)
 
-    # Extract reward. The RunRecordBuilder already called compute_reward()
-    # during build(), so record.reward is populated.
     reward = record.reward
     if reward is None:
         return 0.0
 
-    # Clamp defensively — compute_reward() should always return [0,1] but
-    # belt-and-suspenders here because ACEGEN silently misbehaves on out-of-
-    # range values.
     return float(max(0.0, min(1.0, reward)))
 
 
@@ -165,7 +180,8 @@ def triflag_score(smiles: List[str]) -> List[float]:
         Invalid SMILES → 0.0. Never raises.
 
     Configuration (set at module level before calling):
-        BATCH_ID, GENERATION_NUMBER, SKIP_SIMILARITY, DB_PATH
+        BATCH_ID, GENERATION_NUMBER, SKIP_SIMILARITY, DB_PATH,
+        ENABLE_DEEPPURPOSE
 
     Example:
         >>> import loop.triflag_scorer as scorer
@@ -175,7 +191,6 @@ def triflag_score(smiles: List[str]) -> List[float]:
         >>> scorer.triflag_score(["CCO", "CC(=O)Oc1ccccc1C(=O)O"])
         [0.0, 0.0]   # ethanol and aspirin both score 0 — novelty collapse
     """
-    # Pre-allocate with 0.0 so the length contract holds even on total failure.
     scores: List[float] = [0.0] * len(smiles)
 
     if not smiles:
@@ -202,8 +217,6 @@ def triflag_score(smiles: List[str]) -> List[float]:
                 db=db,
             )
         except Exception as exc:
-            # Any unhandled exception for this molecule → 0.0, log and continue.
-            # Never propagate — a raised exception here kills the ACEGEN loop.
             logger.warning(
                 "triflag_score: unhandled exception for SMILES %r at index %d: %s",
                 smi,
@@ -215,11 +228,12 @@ def triflag_score(smiles: List[str]) -> List[float]:
 
     logger.info(
         "triflag_score: batch complete — %d molecules, "
-        "mean=%.4f, batch_id=%s, generation=%s",
+        "mean=%.4f, batch_id=%s, generation=%s, deeppurpose=%s",
         len(scores),
         sum(scores) / len(scores) if scores else 0.0,
         BATCH_ID,
         GENERATION_NUMBER,
+        ENABLE_DEEPPURPOSE,
     )
 
     return scores

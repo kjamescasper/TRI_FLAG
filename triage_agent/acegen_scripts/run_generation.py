@@ -144,6 +144,8 @@ print(f"  DB_PATH            = {_DB_PATH}")
 # ---------------------------------------------------------------------------
 # Locate and launch ACEGEN reinvent script
 # ---------------------------------------------------------------------------
+import pathlib
+
 _ACEGEN_SCRIPT = os.path.normpath(os.path.join(
     _ROOT, "..", "..", "acegen-open", "scripts", "reinvent", "reinvent.py"
 ))
@@ -151,6 +153,22 @@ _ACEGEN_SCRIPT = os.path.normpath(os.path.join(
 if not os.path.exists(_ACEGEN_SCRIPT):
     print(f"\n[run_generation] ERROR: ACEGEN script not found at:\n  {_ACEGEN_SCRIPT}")
     sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Warm-start checkpoint resolution
+# ---------------------------------------------------------------------------
+_CKPT_DIR  = pathlib.Path(_ROOT) / "runs" / "checkpoints"
+_CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+_PREV_CKPT = _CKPT_DIR / f"gen_{generation_number - 1:03d}_policy.pt"
+_CURR_CKPT = _CKPT_DIR / f"gen_{generation_number:03d}_policy.pt"
+
+_warm_start = _PREV_CKPT.exists() and generation_number > 0
+
+if _warm_start:
+    print(f"\n[run_generation] Warm-start: checkpoint found → {_PREV_CKPT}")
+else:
+    print(f"\n[run_generation] Cold-start: no checkpoint for gen {generation_number - 1}, using ascii.pt prior")
 
 print(f"\n[run_generation] Launching ACEGEN:")
 print(f"  Script: {_ACEGEN_SCRIPT}")
@@ -173,4 +191,87 @@ _script_src = _script_src.replace(
     'os.chdir(os.environ.get("TEMP", os.environ.get("TMP", os.path.expanduser("~"))))'
 )
 
-exec(compile(_script_src, _ACEGEN_SCRIPT, "exec"), {"__name__": "__main__", "__file__": _ACEGEN_SCRIPT})
+# ---------------------------------------------------------------------------
+# Warm-start patch — replace ckpt_path in-place after models registry unpack
+#
+# reinvent.py unpacks: (create_actor, _, _, voc_path, ckpt_path, tokenizer) = models[cfg.model]
+# then immediately does: ckpt = torch.load(ckpt_path, ...)
+# We insert a single assignment between those two lines to redirect ckpt_path
+# to our saved policy. adapt_state_dict() still runs as normal — same
+# architecture, identical keys, no schema mismatch possible.
+# ---------------------------------------------------------------------------
+_WS_ANCHOR = '(create_actor, _, _, voc_path, ckpt_path, tokenizer) = models[cfg.model]'
+
+if _warm_start:
+    if _WS_ANCHOR in _script_src:
+        _ws_injection = (
+            f'\n    # [TRI_FLAG warm-start] override ckpt_path with trained policy from previous generation\n'
+            f'    ckpt_path = r"{_PREV_CKPT}"\n'
+            f'    print(f"[warm_start] Loading policy weights from: {{ckpt_path}}")\n'
+        )
+        _script_src = _script_src.replace(_WS_ANCHOR, _WS_ANCHOR + _ws_injection)
+        print(f"[run_generation] Warm-start patch applied — ckpt_path redirected to gen_{generation_number - 1:03d} policy")
+    else:
+        print(f"[run_generation] WARNING: Warm-start anchor not found in reinvent.py — falling back to cold-start")
+        print(f"[run_generation]   Expected: '{_WS_ANCHOR}'")
+
+# ---------------------------------------------------------------------------
+# Checkpoint-save patch — expose actor_training after the training loop ends
+#
+# run_reinvent() in reinvent.py ends after the while loop with no return value.
+# We inject a global assignment at the bottom of run_reinvent() so that after
+# exec() completes, _exec_ns contains _triflag_actor_training and we can call
+# .state_dict() on it to save the checkpoint.
+#
+# Injection point: the blank line immediately before def get_log_prob(...),
+# which is the first function defined after run_reinvent() closes.
+# ---------------------------------------------------------------------------
+_SAVE_ANCHOR = '\ndef get_log_prob(data, model):'
+
+if _SAVE_ANCHOR in _script_src:
+    _save_injection = (
+        '\n\n    # [TRI_FLAG checkpoint] expose trained actor for post-exec save\n'
+        '    global _triflag_actor_training\n'
+        '    _triflag_actor_training = actor_training\n'
+    )
+    _script_src = _script_src.replace(_SAVE_ANCHOR, _save_injection + _SAVE_ANCHOR)
+    print(f"[run_generation] Checkpoint-save patch applied — actor_training will be captured after run")
+else:
+    print(f"[run_generation] WARNING: Checkpoint-save anchor not found in reinvent.py — checkpoint will not be saved")
+    print(f"[run_generation]   Expected: '{_SAVE_ANCHOR.strip()}'")
+
+# ---------------------------------------------------------------------------
+# Execute ACEGEN
+# ---------------------------------------------------------------------------
+_exec_ns = {"__name__": "__main__", "__file__": _ACEGEN_SCRIPT}
+exec(compile(_script_src, _ACEGEN_SCRIPT, "exec"), _exec_ns)
+
+# ---------------------------------------------------------------------------
+# Save policy checkpoint after run completes
+# ---------------------------------------------------------------------------
+_actor = _exec_ns.get("_triflag_actor_training")
+
+if _actor is not None and hasattr(_actor, "state_dict"):
+    import torch as _torch
+    _torch.save(_actor.state_dict(), str(_CURR_CKPT))
+    print(f"\n[run_generation] Checkpoint saved → {_CURR_CKPT}")
+    print(f"[run_generation] Gen {generation_number + 1} will warm-start from this checkpoint")
+else:
+    # Fallback: scan gc for the largest nn.Module in memory
+    print(f"\n[run_generation] actor_training not in exec namespace — trying gc fallback...")
+    import gc
+    import torch.nn as _nn
+    import torch as _torch
+    _modules = [
+        obj for obj in gc.get_objects()
+        if isinstance(obj, _nn.Module)
+        and sum(p.numel() for p in obj.parameters()) > 50_000
+    ]
+    if _modules:
+        _policy = max(_modules, key=lambda m: sum(p.numel() for p in m.parameters()))
+        _torch.save(_policy.state_dict(), str(_CURR_CKPT))
+        print(f"[run_generation] Checkpoint saved via gc fallback → {_CURR_CKPT}")
+        print(f"[run_generation] Gen {generation_number + 1} will warm-start from this checkpoint")
+    else:
+        print(f"[run_generation] WARNING: No checkpoint saved for gen {generation_number}")
+        print(f"[run_generation] Gen {generation_number + 1} will cold-start from ascii.pt prior")

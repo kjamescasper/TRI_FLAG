@@ -1,14 +1,19 @@
 TRI_FLAG Oracle APEX Export
-Generated: 2026-04-10T14:14:31.895121+00:00
+Generated: 2026-04-10 14:25:05 UTC
 Database:  C:\Users\judge\OneDrive\Desktop\Lab Code\TRI_FLAG\triage_agent\runs\triflag.db
 Min reward (top candidates): 0.4
 
 Files:
-  triflag_molecules.csv      — all triage_runs, all decisions
-  triflag_generations.csv    — per-generation aggregate stats
-  triflag_top_candidates.csv — PASS only, reward >= 0.4
+  triflag_molecules.csv      - all triage_runs, generation rows only
+  triflag_generations.csv    - per-generation aggregate stats
+  triflag_top_candidates.csv - PASS only, reward >= 0.4
 
 APEX upload order:
-  1. triflag_generations.csv  (summary view — load first)
+  1. triflag_generations.csv  (summary table - load first)
   2. triflag_top_candidates.csv
-  3. triflag_molecules.csv    (largest — load last)
+  3. triflag_molecules.csv    (largest - load last)
+
+Primary keys for APEX:
+  triflag_molecules.csv      - row_num (integer) or run_id (text UUID)
+  triflag_generations.csv    - batch_id (text)
+  triflag_top_candidates.csv - row_num (integer) or molecule_id (text)

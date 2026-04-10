@@ -1,5 +1,5 @@
 """
-scripts/export_for_apex.py
+export_for_apex.py
 
 Exports TRI_FLAG SQLite data to clean CSVs ready for Oracle APEX upload.
 
@@ -10,15 +10,17 @@ Three files are produced:
   exports/triflag_top_candidates.csv   — PASS only, reward >= 0.40, top candidates
 
 Usage (from triage_agent/ directory):
-    python scripts/export_for_apex.py
+    python export_for_apex.py
 
 Optional flags:
-    --db       path to triflag.db  (default: runs/triflag.db)
-    --out      output directory    (default: exports/)
+    --db          path to triflag.db  (default: runs/triflag.db)
+    --out         output directory    (default: exports/)
     --min-reward  minimum reward for top candidates (default: 0.40)
 
-APEX upload notes:
-  - All timestamps are ISO 8601 (APEX reads these directly)
+APEX compatibility notes:
+  - row_num integer surrogate key added (APEX link/form operations need numeric PK)
+  - Timestamps formatted as YYYY-MM-DD HH:MM:SS (APEX DATE format, no T or timezone)
+  - Orphan pre-pipeline test rows filtered (novel_w9, novel_001 — no generation_number)
   - Boolean columns (is_valid, pains_alert) exported as 0/1 integers
   - NULL values exported as empty cells (APEX treats blank as NULL)
   - Column headers are lowercase with underscores (Oracle-friendly)
@@ -28,16 +30,17 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults — resolved relative to current working directory so the script
+# works without flags when run from triage_agent/:
+#   python export_for_apex.py
 # ---------------------------------------------------------------------------
-_HERE        = Path.cwd()                    # wherever you run the script from
+_HERE        = Path.cwd()
 _DEFAULT_DB  = _HERE / "runs" / "triflag.db"
 _DEFAULT_OUT = _HERE / "exports"
 
@@ -55,7 +58,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _write_csv(path: Path, rows: list[sqlite3.Row], columns: list[str]) -> int:
+def _write_csv(path: Path, rows: list, columns: list[str]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -71,20 +74,28 @@ def _write_csv(path: Path, rows: list[sqlite3.Row], columns: list[str]) -> int:
 # Export 1 — full molecules table
 # ---------------------------------------------------------------------------
 
-def export_molecules(conn: sqlite3.Connection, out_dir: Path) -> Path:
+def export_molecules(conn: sqlite3.Connection, out_dir: Path) -> tuple:
     """
     All triage_runs rows joined with molecules.
     Includes every decision (PASS, FLAG, DISCARD).
-    Columns ordered for readability in APEX.
+
+    APEX fixes:
+      - row_num: integer surrogate key for APEX link/form operations
+      - triaged_at: YYYY-MM-DD HH:MM:SS format (no T or timezone offset)
+      - Filters out orphan pre-pipeline rows (novel_w9, novel_001) that have
+        no generation_number and would appear as unlinked records in APEX
     """
     cursor = conn.execute("""
         SELECT
+            ROW_NUMBER() OVER (
+                ORDER BY tr.generation_number ASC, tr.reward DESC
+            )                                                           AS row_num,
             tr.run_id,
             tr.molecule_id,
             m.canonical_smiles,
             tr.batch_id,
             tr.generation_number,
-            tr.triaged_at,
+            REPLACE(SUBSTR(tr.triaged_at, 1, 19), 'T', ' ')            AS triaged_at,
             tr.final_decision,
             tr.reward,
             tr.s_sa,
@@ -111,11 +122,13 @@ def export_molecules(conn: sqlite3.Connection, out_dir: Path) -> Path:
             tr.rationale
         FROM triage_runs tr
         JOIN molecules m USING (molecule_id)
+        WHERE tr.generation_number IS NOT NULL
+          AND m.canonical_smiles IS NOT NULL
         ORDER BY tr.generation_number ASC, tr.reward DESC NULLS LAST
     """)
 
     columns = [
-        "run_id", "molecule_id", "canonical_smiles", "batch_id",
+        "row_num", "run_id", "molecule_id", "canonical_smiles", "batch_id",
         "generation_number", "triaged_at", "final_decision", "reward",
         "s_sa", "s_nov", "s_qed", "s_act",
         "sa_score", "sa_category",
@@ -135,10 +148,11 @@ def export_molecules(conn: sqlite3.Connection, out_dir: Path) -> Path:
 # Export 2 — per-generation summary
 # ---------------------------------------------------------------------------
 
-def export_generations(conn: sqlite3.Connection, out_dir: Path) -> Path:
+def export_generations(conn: sqlite3.Connection, out_dir: Path) -> tuple:
     """
     One row per batch_id with aggregate statistics.
     Mirrors the get_all_generations_summary MCP tool output.
+    batch_id is the natural primary key for this table in APEX.
     """
     cursor = conn.execute("""
         SELECT
@@ -161,6 +175,7 @@ def export_generations(conn: sqlite3.Connection, out_dir: Path) -> Path:
             ROUND(AVG(s_act), 4)                                        AS mean_s_act
         FROM triage_runs
         WHERE batch_id IS NOT NULL
+          AND generation_number IS NOT NULL
         GROUP BY batch_id, generation_number
         ORDER BY generation_number ASC, batch_id ASC
     """)
@@ -187,14 +202,16 @@ def export_top_candidates(
     conn: sqlite3.Connection,
     out_dir: Path,
     min_reward: float = 0.40,
-) -> Path:
+) -> tuple:
     """
-    PASS decisions only, reward >= min_reward.
+    PASS decisions only, reward >= min_reward, generation_number not null.
     Includes physicochemical properties for APEX table views.
     Sorted by reward DESC so highest candidates appear first.
+    triaged_at formatted as YYYY-MM-DD HH:MM:SS for APEX DATE type.
     """
     cursor = conn.execute("""
         SELECT
+            ROW_NUMBER() OVER (ORDER BY tr.reward DESC)                 AS row_num,
             tr.molecule_id,
             m.canonical_smiles,
             tr.batch_id,
@@ -218,17 +235,19 @@ def export_top_candidates(
             tr.scaffold_smiles,
             tr.pains_alert,
             tr.predicted_affinity,
-            tr.triaged_at
+            REPLACE(SUBSTR(tr.triaged_at, 1, 19), 'T', ' ')            AS triaged_at
         FROM triage_runs tr
         JOIN molecules m USING (molecule_id)
         WHERE tr.final_decision = 'PASS'
           AND tr.reward >= ?
+          AND tr.generation_number IS NOT NULL
+          AND m.canonical_smiles IS NOT NULL
         ORDER BY tr.reward DESC
     """, (min_reward,))
 
     columns = [
-        "molecule_id", "canonical_smiles", "batch_id", "generation_number",
-        "final_decision", "reward",
+        "row_num", "molecule_id", "canonical_smiles", "batch_id",
+        "generation_number", "final_decision", "reward",
         "s_sa", "s_nov", "s_qed", "s_act",
         "sa_score", "nn_tanimoto", "nn_source", "nn_id",
         "mol_weight", "logp", "tpsa", "hbd", "hba", "rotatable_bonds",
@@ -252,11 +271,11 @@ def main():
     )
     parser.add_argument(
         "--db", type=Path, default=_DEFAULT_DB,
-        help=f"Path to triflag.db (default: {_DEFAULT_DB})",
+        help=f"Path to triflag.db (default: runs/triflag.db)",
     )
     parser.add_argument(
         "--out", type=Path, default=_DEFAULT_OUT,
-        help=f"Output directory (default: {_DEFAULT_OUT})",
+        help=f"Output directory (default: exports/)",
     )
     parser.add_argument(
         "--min-reward", type=float, default=0.40,
@@ -264,7 +283,7 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"\n[apex_export] TRI_FLAG → Oracle APEX Export")
+    print(f"\n[apex_export] TRI_FLAG -> Oracle APEX Export")
     print(f"  Database : {args.db}")
     print(f"  Output   : {args.out}")
     print(f"  Min reward (top candidates): {args.min_reward}\n")
@@ -273,35 +292,39 @@ def main():
 
     # --- molecules ---
     path, n = export_molecules(conn, args.out)
-    print(f"  [1/3] triflag_molecules.csv      {n:>7,} rows  →  {path}")
+    print(f"  [1/3] triflag_molecules.csv      {n:>7,} rows  ->  {path}")
 
     # --- generations ---
     path, n = export_generations(conn, args.out)
-    print(f"  [2/3] triflag_generations.csv    {n:>7,} rows  →  {path}")
+    print(f"  [2/3] triflag_generations.csv    {n:>7,} rows  ->  {path}")
 
     # --- top candidates ---
     path, n = export_top_candidates(conn, args.out, args.min_reward)
-    print(f"  [3/3] triflag_top_candidates.csv {n:>7,} rows  →  {path}")
+    print(f"  [3/3] triflag_top_candidates.csv {n:>7,} rows  ->  {path}")
 
     conn.close()
 
     # --- export manifest ---
     manifest_path = args.out / "export_manifest.txt"
     with open(manifest_path, "w", encoding="utf-8") as f:
-        f.write(f"TRI_FLAG Oracle APEX Export\n")
-        f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n")
+        f.write("TRI_FLAG Oracle APEX Export\n")
+        f.write(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
         f.write(f"Database:  {args.db}\n")
         f.write(f"Min reward (top candidates): {args.min_reward}\n\n")
         f.write("Files:\n")
-        f.write("  triflag_molecules.csv      — all triage_runs, all decisions\n")
-        f.write("  triflag_generations.csv    — per-generation aggregate stats\n")
-        f.write(f"  triflag_top_candidates.csv — PASS only, reward >= {args.min_reward}\n\n")
+        f.write("  triflag_molecules.csv      - all triage_runs, generation rows only\n")
+        f.write("  triflag_generations.csv    - per-generation aggregate stats\n")
+        f.write(f"  triflag_top_candidates.csv - PASS only, reward >= {args.min_reward}\n\n")
         f.write("APEX upload order:\n")
-        f.write("  1. triflag_generations.csv  (summary view — load first)\n")
+        f.write("  1. triflag_generations.csv  (summary table - load first)\n")
         f.write("  2. triflag_top_candidates.csv\n")
-        f.write("  3. triflag_molecules.csv    (largest — load last)\n")
+        f.write("  3. triflag_molecules.csv    (largest - load last)\n\n")
+        f.write("Primary keys for APEX:\n")
+        f.write("  triflag_molecules.csv      - row_num (integer) or run_id (text UUID)\n")
+        f.write("  triflag_generations.csv    - batch_id (text)\n")
+        f.write("  triflag_top_candidates.csv - row_num (integer) or molecule_id (text)\n")
 
-    print(f"\n  Manifest  →  {manifest_path}")
+    print(f"\n  Manifest  ->  {manifest_path}")
     print(f"\n[apex_export] Done.\n")
 
 

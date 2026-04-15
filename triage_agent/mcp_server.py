@@ -20,6 +20,8 @@ Tools exposed:
     analyze_top_candidates(n?, batch_id?, min_reward?) -> top molecules with scientific interpretation
     launch_generation(generation_number?) -> launch ACEGEN run as background process
     get_generation_progress(generation_number?) -> live progress for a running generation
+    get_pass_candidates(n?, batch_id?, min_reward?) -> PASS-only top molecules by reward
+    analyze_pass_candidates(n?, batch_id?, min_reward?) -> PASS-only molecules with scientific interpretation
 """
 
 import logging
@@ -974,6 +976,276 @@ def get_generation_progress(generation_number: int = None) -> str:
         lines.append(f"\n  ✓ Generation {gen} complete.")
     else:
         lines.append(f"\n  Run get_generation_progress({gen}) again to refresh.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11 — get_pass_candidates
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_pass_candidates(
+    n: int = 10,
+    batch_id: str = None,
+    min_reward: float = 0.0,
+) -> str:
+    """
+    Return the top N PASS-only molecules by reward score.
+
+    Identical to get_top_candidates but pre-filtered to PASS decisions only.
+    Flagged molecules (patent hits, IP risk) are excluded regardless of their
+    reward score. Use this for clean candidate shortlists for docking or
+    lab follow-up.
+
+    Args:
+        n: Number of top candidates to return (default: 10, max: 50)
+        batch_id: Filter to a specific batch e.g. 'gen_001' (default: all batches)
+        min_reward: Only include molecules with reward >= this value (default: 0.0)
+    """
+    from database.db import DatabaseManager
+    try:
+        n = min(n, 50)
+        db = DatabaseManager(_DB_PATH)
+        # Fetch extra rows to account for filtered-out FLAG/DISCARD molecules
+        rows = db.get_top_n_by_reward(n * 3, batch_id=batch_id)
+    except Exception as exc:
+        return f"Error querying database: {exc}"
+
+    if not rows:
+        scope = f" in batch '{batch_id}'" if batch_id else ""
+        return f"No candidates found{scope}."
+
+    filtered = [
+        dict(r) for r in rows
+        if (dict(r).get("reward") or 0) >= min_reward
+        and dict(r).get("final_decision") == "PASS"
+    ][:n]
+
+    if not filtered:
+        return f"No PASS candidates found with reward >= {min_reward}."
+
+    scope = f" from batch '{batch_id}'" if batch_id else " across all runs"
+    lines = [f"Top {len(filtered)} PASS candidates{scope}:"]
+    lines.append(f"{'Rank':<5} {'Molecule ID':<26} {'Decision':<10} {'Reward':<8} {'S_sa':<6} {'S_nov':<6} {'S_qed':<6} {'Batch'}")
+    lines.append("-" * 90)
+
+    for i, r in enumerate(filtered, 1):
+        mol_id    = (r.get("molecule_id") or "?")[:25]
+        decision  = r.get("final_decision") or "?"
+        reward    = r.get("reward") or 0.0
+        s_sa      = r.get("s_sa")
+        s_nov     = r.get("s_nov")
+        s_qed     = r.get("s_qed")
+        batch     = r.get("batch_id") or "?"
+        s_sa_str  = f"{s_sa:.3f}"  if s_sa  is not None else "  — "
+        s_nov_str = f"{s_nov:.3f}" if s_nov is not None else "  — "
+        s_qed_str = f"{s_qed:.3f}" if s_qed is not None else "  — "
+        lines.append(
+            f"{i:<5} {mol_id:<26} {decision:<10} {reward:<8.4f} {s_sa_str:<6} {s_nov_str:<6} {s_qed_str:<6} {batch}"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool 12 — analyze_pass_candidates
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def analyze_pass_candidates(
+    n: int = 10,
+    batch_id: str = None,
+    min_reward: float = 0.0,
+) -> str:
+    """
+    Return the top N PASS-only molecules with full scientific interpretation.
+
+    Identical to analyze_top_candidates but pre-filtered to PASS decisions only.
+    Flagged molecules (patent hits, IP risk) are excluded regardless of their
+    reward score. Use this for clean candidate analysis for docking or
+    medicinal chemistry review.
+
+    Args:
+        n: Number of top candidates to analyze (default: 10, max: 20)
+        batch_id: Filter to a specific batch e.g. 'gen_001' (default: all)
+        min_reward: Only include molecules with reward >= this value (default: 0.0)
+    """
+    import sqlite3
+
+    n = min(n, 20)
+
+    try:
+        from database.db import DatabaseManager
+        db = DatabaseManager(_DB_PATH)
+        # Fetch extra rows to account for filtered-out FLAG/DISCARD molecules
+        rows = db.get_top_n_by_reward(n * 3, batch_id=batch_id)
+    except Exception as exc:
+        return f"Error querying database: {exc}"
+
+    if not rows:
+        scope = f" in batch '{batch_id}'" if batch_id else ""
+        return f"No candidates found{scope}."
+
+    filtered = [
+        dict(r) for r in rows
+        if (dict(r).get("reward") or 0) >= min_reward
+        and dict(r).get("final_decision") == "PASS"
+    ][:n]
+
+    if not filtered:
+        return f"No PASS candidates found with reward >= {min_reward}."
+
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        mol_ids = [r.get("molecule_id") for r in filtered]
+        placeholders = ",".join("?" * len(mol_ids))
+        extra_rows = conn.execute(f"""
+            SELECT molecule_id, mol_weight, logp, tpsa, hbd, hba,
+                   rotatable_bonds, scaffold_smiles, pains_alert,
+                   nn_tanimoto, nn_source, nn_id, similarity_decision,
+                   sa_score, sa_category, generation_number, batch_id
+            FROM triage_runs
+            WHERE molecule_id IN ({placeholders})
+        """, mol_ids).fetchall()
+        conn.close()
+        extra = {row[0]: row for row in extra_rows}
+    except Exception:
+        extra = {}
+
+    scope = f" from batch '{batch_id}'" if batch_id else " across all runs"
+    lines = [
+        f"Top {len(filtered)} PASS Candidate Analysis{scope}",
+        "=" * 60,
+        "",
+    ]
+
+    for i, r in enumerate(filtered, 1):
+        mol_id   = r.get("molecule_id") or "?"
+        reward   = r.get("reward") or 0.0
+        s_sa     = r.get("s_sa")
+        s_nov    = r.get("s_nov")
+        s_qed    = r.get("s_qed")
+        decision = r.get("final_decision") or "?"
+        batch    = r.get("batch_id") or "?"
+        gen      = r.get("generation_number")
+
+        ex = extra.get(mol_id)
+        mw        = ex[1]  if ex else None
+        logp      = ex[2]  if ex else None
+        tpsa      = ex[3]  if ex else None
+        hbd       = ex[4]  if ex else None
+        hba       = ex[5]  if ex else None
+        rotb      = ex[6]  if ex else None
+        scaffold  = ex[7]  if ex else None
+        pains     = ex[8]  if ex else None
+        tanimoto  = ex[9]  if ex else None
+        nn_source = ex[10] if ex else None
+        nn_id     = ex[11] if ex else None
+        sa_score  = ex[13] if ex else None
+        sa_cat    = ex[14] if ex else None
+
+        lines.append(f"#{i} — {mol_id}")
+        lines.append(f"   Batch: {batch}  |  Generation: {gen if gen is not None else '—'}")
+        lines.append(f"   Decision: {decision}  |  Reward: {reward:.4f}")
+        lines.append("")
+
+        lines.append("   Score Breakdown:")
+        if s_sa is not None:
+            sa_interp = (
+                "excellent — very easy to synthesize" if s_sa > 0.85 else
+                "good — straightforward synthesis" if s_sa > 0.65 else
+                "moderate — challenging but feasible" if s_sa > 0.40 else
+                "poor — difficult synthesis"
+            )
+            lines.append(f"     S_sa  = {s_sa:.3f}  ({sa_interp})")
+        if s_nov is not None:
+            nov_interp = (
+                "fully novel — no close known analogues" if s_nov > 0.95 else
+                "high novelty" if s_nov > 0.70 else
+                "moderate novelty — some similarity to known compounds" if s_nov > 0.30 else
+                "low novelty — similar to known drugs"
+            )
+            lines.append(f"     S_nov = {s_nov:.3f}  ({nov_interp})")
+        if s_qed is not None:
+            qed_interp = (
+                "excellent drug-likeness" if s_qed > 0.70 else
+                "good drug-likeness" if s_qed > 0.50 else
+                "moderate drug-likeness" if s_qed > 0.30 else
+                "poor drug-likeness"
+            )
+            lines.append(f"     S_qed = {s_qed:.3f}  ({qed_interp})")
+        lines.append("")
+
+        if any(v is not None for v in [mw, logp, tpsa, hbd, hba]):
+            lines.append("   Physicochemical Properties:")
+            if mw   is not None: lines.append(f"     MW:   {mw:.1f} Da  {'⚠ Ro5 violation (>500)' if mw > 500 else '✓ Ro5 compliant'}")
+            if logp is not None: lines.append(f"     logP: {logp:.2f}    {'⚠ Ro5 violation (>5)' if logp > 5 else '✓ Ro5 compliant'}")
+            if tpsa is not None:
+                cns = " — good CNS penetration" if tpsa < 90 else " — limited CNS penetration" if tpsa < 140 else " — poor CNS penetration"
+                lines.append(f"     TPSA: {tpsa:.1f} Å²{cns}")
+            if hbd  is not None: lines.append(f"     HBD:  {hbd}       {'⚠ Ro5 violation (>5)' if hbd > 5 else '✓ Ro5 compliant'}")
+            if hba  is not None: lines.append(f"     HBA:  {hba}       {'⚠ Ro5 violation (>10)' if hba > 10 else '✓ Ro5 compliant'}")
+            if rotb is not None: lines.append(f"     RotB: {rotb}")
+            lines.append("")
+
+        if tanimoto is not None and tanimoto > 0:
+            lines.append("   IP / Similarity:")
+            lines.append(f"     Nearest neighbor: {nn_id or '?'} ({nn_source or '?'})")
+            lines.append(f"     Tanimoto: {tanimoto:.3f}  " + (
+                "⚠ HIGH similarity — strong IP risk, review before advancing" if tanimoto >= 0.90 else
+                "moderate similarity — conduct freedom-to-operate search" if tanimoto >= 0.70 else
+                "low similarity — likely novel territory"
+            ))
+            lines.append("")
+
+        if pains is not None:
+            if pains:
+                lines.append("   ⚠ PAINS ALERT — structural alerts detected")
+                lines.append("     Validate activity with orthogonal assay before advancing.")
+                lines.append("")
+            else:
+                lines.append("   ✓ No PAINS alerts")
+                lines.append("")
+
+        if scaffold:
+            lines.append(f"   Scaffold: {scaffold}")
+            lines.append("")
+
+        flags_list = []
+        if s_nov is not None and s_nov < 0.30:
+            flags_list.append("low novelty limits scientific value")
+        if s_sa is not None and s_sa < 0.40:
+            flags_list.append("difficult synthesis may block wet-lab follow-up")
+        if tanimoto is not None and tanimoto >= 0.90:
+            flags_list.append("IP similarity requires legal review")
+        if pains:
+            flags_list.append("PAINS alert requires orthogonal validation")
+        if mw is not None and mw > 500:
+            flags_list.append("MW violates Lipinski Ro5")
+        if tpsa is not None and tpsa > 90:
+            flags_list.append("TPSA may limit CNS penetration (relevant for BACE1)")
+
+        if flags_list:
+            lines.append(f"   ⚠ Flags: {' | '.join(flags_list)}")
+        else:
+            lines.append("   ✓ No flags — strong candidate across all dimensions")
+
+        lines.append("")
+        lines.append("-" * 60)
+        lines.append("")
+
+    rewards  = [r.get("reward") or 0 for r in filtered]
+    nov_vals = [r.get("s_nov") for r in filtered if r.get("s_nov") is not None]
+    qed_vals = [r.get("s_qed") for r in filtered if r.get("s_qed") is not None]
+
+    lines.append("Summary Across Analyzed Candidates:")
+    lines.append(f"  Mean reward:  {sum(rewards)/len(rewards):.4f}")
+    lines.append(f"  Reward range: {min(rewards):.4f} – {max(rewards):.4f}")
+    if nov_vals:
+        lines.append(f"  Mean S_nov:   {sum(nov_vals)/len(nov_vals):.3f}")
+    if qed_vals:
+        lines.append(f"  Mean S_qed:   {sum(qed_vals)/len(qed_vals):.3f}")
 
     return "\n".join(lines)
 

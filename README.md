@@ -7,17 +7,31 @@
 
 TRI_FLAG wraps [ACEGEN](https://github.com/Acellera/acegen-open) reinforcement learning and [DeepPurpose](https://github.com/kexinhuang12345/DeepPurpose) binding prediction inside a five-tool molecular triage pipeline that scores, filters, and stores every generated molecule in a live SQLite database. The reward function enforces synthesis feasibility, IP novelty, drug-likeness, and BACE1 binding affinity simultaneously. Across 8 generation runs the pipeline has scored **34,915 molecules**.
 
-*Oracle APEX* public URL: **https://oracleapex.com/ords/r/info_triflag/tri-flag/home**
+**Oracle APEX public URL:** https://oracleapex.com/ords/r/info_triflag/tri-flag/home
 
 *More information is available through Notion upon request.*
 
 ```
 ACEGEN generates SMILES
-    -> triflag_score() evaluates each one
-        -> R = S_sa × S_nov × S_qed × S_act
-            -> reward updates RL policy
-                -> molecule stored in SQLite with full provenance
+    → triflag_score() evaluates each one
+        → R = S_sa × S_nov × S_qed × S_act
+            → reward updates RL policy
+                → molecule stored in SQLite with full provenance
 ```
+
+---
+
+## Database Access
+
+The complete TRI_FLAG molecule database (34,915 molecules, 8 generations) is available three ways:
+
+| Method | Location | What's there |
+|--------|----------|--------------|
+| **Browse online (Oracle APEX)** | https://oracleapex.com/ords/r/info_triflag/tri-flag/home | Searchable, filterable web interface — generations summary, top candidates, full molecule table. No login required. |
+| **Download full database (ZIP)** | [`exports/triflag_data.zip`](exports/triflag_data.zip) in this repo | `triflag.db` (SQLite, all 34,915 molecules) + 4 CSVs + manifest. Download and open with DB Browser for SQLite or any SQLite client. |
+| **Programmatic access** | Clone repo → `triage_agent/runs/triflag.db` after unzipping | `from database.db import DatabaseManager` — see Usage section |
+
+> **Why two access methods?** Oracle APEX free tier has a row/storage limit — the full 34,915-molecule database exceeds it. The APEX instance hosts curated views (generation summaries, top candidates, key physicochemical properties). The complete database with all columns and all rows is in `exports/triflag_data.zip`.
 
 ---
 
@@ -25,7 +39,7 @@ ACEGEN generates SMILES
 
 | Gen | Molecules | Mean Reward | Max Reward | Pass% | Notes |
 |-----|-----------|-------------|------------|-------|-------|
-| gen_000 | 4,172 | 0.4346* | 0.4957 | 95.4% | 3-component reward - not comparable |
+| gen_000 | 4,172 | 0.4346* | 0.4957 | 95.4% | 3-component reward — not comparable |
 | gen_001 | 4,018 | 0.1094 | 0.5337 | 93.4% | First full 4-component run |
 | gen_002 | 1,530 | 0.0778 | 0.5388 | 90.3% | Truncated |
 | gen_003 | 1,283 | 0.0792 | 0.5388 | 90.9% | Truncated |
@@ -34,9 +48,9 @@ ACEGEN generates SMILES
 | gen_006 | 6,521 | 0.1314 | **0.7049** | 92.7% | Cold-start; matched Gen 5 max; first checkpoint saved |
 | gen_007 | 8,551 | **0.2242** | 0.6422 | 96.0% | **First warm-start: +69% mean reward** |
 
-*Gen 0 excluded from RL trend analysis - used 3-component reward without S_act.*
+*Gen 0 excluded from RL trend analysis — used 3-component reward without S_act.*
 
-**The primary RL finding:** loading `gen_006_policy.pt` into Generation 7 produced a +69% improvement in mean reward (0.1314 -> 0.2242), with 8 of the all-time top 10 candidates emerging from that single warm-start run - at scaffolds never seen in any cold-start generation.
+**The primary RL finding:** loading `gen_006_policy.pt` into Generation 7 produced a +69% improvement in mean reward (0.1314 → 0.2242), with 8 of the all-time top 10 candidates emerging from that single warm-start run — at scaffolds never seen in any cold-start generation.
 
 ---
 
@@ -60,7 +74,7 @@ pip install rdkit requests aiohttp streamlit fastmcp
 pip install torchrl==0.8.1 tensordict==0.8.1
 pip install -e acegen-open/
 
-# DeepPurpose (optional - required for S_act scoring)
+# DeepPurpose (optional — required for S_act scoring)
 # Must set env var FIRST to avoid Windows shm.dll crash (see Known Issues)
 set TRIFLAG_ENABLE_DEEPPURPOSE=1
 pip install DeepPurpose
@@ -85,7 +99,7 @@ python main.py --smiles "O=C(NC1CC1)c1ccc(-c2ccnc2)cc1" --molecule-id my_mol
 ```bash
 cd triage_agent && conda activate triflag
 streamlit run streamlit_app.py
-# -> http://localhost:8501
+# → http://localhost:8501
 ```
 
 **Run a new generation:**
@@ -112,7 +126,7 @@ for r in db.get_top_n_by_reward(10):
 ```bash
 cd triage_agent && conda activate triflag
 python mcp_server.py
-# Add to Claude Desktop -> Settings -> MCP Servers
+# Add to Claude Desktop → Settings → MCP Servers
 ```
 
 ---
@@ -125,37 +139,37 @@ python mcp_server.py
 R = S_sa × S_nov × S_qed × S_act
 ```
 
-All four factors must be good simultaneously - a synthetically inaccessible molecule or a patent match scores near zero regardless of how well it binds BACE1.
+All four factors must be good simultaneously — a synthetically inaccessible molecule or a patent match scores near zero regardless of how well it binds BACE1.
 
 | Factor | What it measures | Implementation |
 |--------|-----------------|----------------|
 | **S_sa** | Synthetic accessibility | Ertl-Schuffenhauer SA score via RDKit; sigmoid transform (midpoint 4.5, k=1.5); hard discard at SA > 7 |
 | **S_nov** | IP novelty | ECFP4 Tanimoto vs ChEMBL (~2.4M) + SureChEMBL (~28M patents); FLAG at Tanimoto ≥ 0.70 |
 | **S_qed** | Drug-likeness | Bickerton QED via RDKit; composite of 8 physicochemical descriptors |
-| **S_act** | BACE1 binding affinity | DeepPurpose MPNN_CNN_BindingDB; pIC50 normalized to [0,1] (4.0->0.0, 10.0->1.0) |
+| **S_act** | BACE1 binding affinity | DeepPurpose MPNN_CNN_BindingDB; pIC50 normalized to [0,1] (4.0→0.0, 10.0→1.0) |
 
-The all-time max reward of 0.7049 is **S_act-suppressed** - a proof in `tests/test_scoring_validation.py` shows S_sa × S_nov × S_qed exceeds 0.7049 for the record molecule, implying S_act ≈ 0.797 (predicted BACE1 pIC50 ~8.8 nM).
+The all-time max reward of 0.7049 is **S_act-suppressed** — a proof in `tests/test_scoring_validation.py` shows S_sa × S_nov × S_qed exceeds 0.7049 for the record molecule, implying S_act ≈ 0.797 (predicted BACE1 pIC50 ~8.8 nM).
 
 ### Triage Pipeline (Module 1)
 
 Five tools run in sequence with early-termination: an invalid SMILES or SA > 7 halts immediately.
 
 ```
-ValidityTool     -> RDKit SMILES parsing + canonicalization -> DISCARD if invalid
-DescriptorTool   -> MW, logP, TPSA, HBD, HBA, rotatable bonds, Ro5, Murcko scaffold
-SAScoreTool      -> Ertl-Schuffenhauer score -> DISCARD if SA > 7; sigmoid -> S_sa
-SimilarityTool   -> ECFP4 Tanimoto vs ChEMBL / SureChEMBL / PubChem -> FLAG if ≥ 0.70
-PAINSTool        -> PAINS_A/B/C via RDKit FilterCatalog -> advisory FLAG
+ValidityTool     → RDKit SMILES parsing + canonicalization → DISCARD if invalid
+DescriptorTool   → MW, logP, TPSA, HBD, HBA, rotatable bonds, Ro5, Murcko scaffold
+SAScoreTool      → Ertl-Schuffenhauer score → DISCARD if SA > 7; sigmoid → S_sa
+SimilarityTool   → ECFP4 Tanimoto vs ChEMBL / SureChEMBL / PubChem → FLAG if ≥ 0.70
+PAINSTool        → PAINS_A/B/C via RDKit FilterCatalog → advisory FLAG
 ```
 
-Every decision includes a plain-English rationale from `RationaleBuilder`. Mean SA score across all 34,915 molecules: **2.996 / 10** - well below the discard threshold of 7, confirming the RL agent consistently produces synthetically feasible candidates.
+Every decision includes a plain-English rationale from `RationaleBuilder`. Mean SA score across all 34,915 molecules: **2.996 / 10** — well below the discard threshold of 7, confirming the RL agent consistently produces synthetically feasible candidates.
 
 ### ACEGEN Warm-Start (Module 2)
 
 ACEGEN calls `triflag_score(smiles: List[str]) -> List[float]` in `loop/triflag_scorer.py` as its reward oracle. ACEGEN's `logger_backend: null` saves no native checkpoints. TRI_FLAG enables warm-start via an in-memory two-point patch of `reinvent.py` before `exec()`:
 
-- **Point 1** - overrides `ckpt_path` to load from `runs/checkpoints/gen_NNN_policy.pt` instead of the frozen prior
-- **Point 2** - injects a global reference to expose actor weights post-run for saving
+- **Point 1** — overrides `ckpt_path` to load from `runs/checkpoints/gen_NNN_policy.pt` instead of the frozen prior
+- **Point 2** — injects a global reference to expose actor weights post-run for saving
 
 ### DeepPurpose BACE1 Scoring (Module 3)
 
@@ -202,12 +216,13 @@ TRI_FLAG/
 │
 └── triage_agent/                           # All pipeline code
     │
-    ├── main.py                             # CLI entry point - triage a single molecule
+    ├── main.py                             # CLI entry point — triage a single molecule
     ├── streamlit_app.py                    # Interactive dashboard (4 tabs)
-    ├── mcp_server.py                       # FastMCP server - 12 tools for Claude Desktop
+    ├── mcp_server.py                       # FastMCP server — 12 tools for Claude Desktop
     ├── molecule.py                         # Root-level molecule dataclass (legacy, preserved)
     ├── backfill_inchikeys.py               # One-time script: retroactively computed InChIKeys
-    ├── export_for_apex.py                  # Writes exports/ CSVs for Oracle APEX upload
+    ├── export_for_apex.py                  # Curated CSVs for Oracle APEX (joined/filtered views)
+    ├── export_for_apex_full.py             # Faithful 1:1 SQLite dump — one CSV per table, no filtering
     ├── test_molecules.csv                  # Small molecule test set for pipeline validation
     ├── pytest.ini                          # pytest configuration
     │
@@ -220,7 +235,7 @@ TRI_FLAG/
     │   ├── base_tool.py                    # BaseTool ABC: run(), name, description
     │   ├── validity_tool.py                # RDKit SMILES parsing + canonicalization
     │   ├── descriptor_tool.py              # MW, logP, TPSA, HBD/HBA, Ro5 check, Murcko scaffold
-    │   ├── sa_score_tool.py                # Ertl-Schuffenhauer score + sigmoid transform -> S_sa
+    │   ├── sa_score_tool.py                # Ertl-Schuffenhauer score + sigmoid transform → S_sa
     │   ├── similarity_tool.py              # ECFP4 Tanimoto vs ChEMBL / SureChEMBL / PubChem
     │   ├── similarity_tool_backup_gen1.py  # Pre-SureChEMBL-rebuild backup (preserved)
     │   └── pains_tool.py                   # PAINS_A/B/C via RDKit FilterCatalog
@@ -231,17 +246,17 @@ TRI_FLAG/
     │   └── molecule_utils.py               # SMILES canonicalization, InChI/InChIKey, formula
     │
     ├── policies/                           # Decision logic
-    │   ├── policy_engine.py                # PolicyEngine: aggregates tool outputs -> final decision
+    │   ├── policy_engine.py                # PolicyEngine: aggregates tool outputs → final decision
     │   └── thresholds.py                   # SAScoreThresholds: default / lead_opt / nat_prod / fragment
     │
     ├── reporting/                          # Output assembly
-    │   ├── scoring.py                      # compute_reward() -> RewardResult (R = S_sa×S_nov×S_qed×S_act)
+    │   ├── scoring.py                      # compute_reward() → RewardResult (R = S_sa×S_nov×S_qed×S_act)
     │   ├── run_record.py                   # RunRecord + RunRecordBuilder + save() + load_as_dicts()
     │   └── rationale_builder.py            # Plain-English decision explanations
     │
     ├── loop/                               # ACEGEN reward function interface
     │   ├── config_triflag.yaml             # ACEGEN YAML config pointing to triflag_scorer
-    │   └── triflag_scorer.py               # triflag_score(smiles: List[str]) -> List[float]
+    │   └── triflag_scorer.py               # triflag_score(smiles: List[str]) → List[float]
     │
     ├── acegen_scripts/                     # Generation runner scripts
     │   ├── run_generation.py               # Main runner: cold-start / --warm-start / --gen N
@@ -268,10 +283,8 @@ TRI_FLAG/
     │       ├── scaffold_diversity.png
     │       └── generation_summary.csv
     │
-    ├── runs/                               # Live data (tracked in git)
-    │   ├── triflag.db                      # SQLite database - 34,915 molecules, 8 generations
-    │   ├── triflag.db-shm                  # WAL shared memory (auto-generated, safe to delete)
-    │   ├── triflag.db-wal                  # WAL log (auto-generated, safe to delete)
+    ├── runs/                               # Live data (NOT tracked in git — see exports/ for database)
+    │   ├── triflag.db                      # SQLite database — download from exports/triflag_data.zip
     │   ├── triage_runs.jsonl               # JSONL run log for Streamlit session history
     │   ├── batch_streamlit.jsonl           # Batch results from Streamlit UI
     │   ├── batch_test.jsonl                # Batch results from test runs
@@ -280,11 +293,16 @@ TRI_FLAG/
     │       ├── gen_006_policy.pt           # Gen 6 cold-start policy (baseline for warm-start)
     │       └── gen_007_policy.pt           # Gen 7 warm-start policy (current best)
     │
-    ├── exports/                            # Static CSVs for Oracle APEX public database
-    │   ├── triflag_molecules.csv           # All 34,915 molecules with physicochemical properties
+    ├── exports/                            # Database exports — full data available here
+    │   ├── triflag_data.zip                # *** FULL DATABASE *** triflag.db + all 4 CSVs (download this)
+    │   ├── triflag_molecules.csv           # Curated: all molecules with physicochemical properties
     │   ├── triflag_generations.csv         # Per-generation summary statistics
-    │   ├── triflag_top_candidates.csv      # Top candidates shortlist for docking prioritization
-    │   └── export_manifest.txt             # Export metadata: timestamp, row counts, schema
+    │   ├── triflag_top_candidates.csv      # Top candidates shortlist (reward ≥ 0.4, PASS only)
+    │   ├── export_manifest.txt             # Export metadata: timestamp, row counts, schema
+    │   ├── apex_molecules.csv              # Full 1:1 dump of molecules table (7 cols)
+    │   ├── apex_triage_runs.csv            # Full 1:1 dump of triage_runs table (34 cols)
+    │   ├── apex_batches.csv                # Full 1:1 dump of batches table
+    │   └── apex_target_predictions.csv     # Full 1:1 dump of target_predictions table
     │
     └── tests/                              # 374 passing, 2 skipped (network)
         ├── test_agent.py                   # TriageAgent integration tests
@@ -309,7 +327,7 @@ TRI_FLAG/
 | `batches` | One row per generation batch | `batch_id`, `generation_number`, `mean_reward`, `pass_count`, `flag_count`, `discard_count` |
 | `target_predictions` | DeepPurpose outputs | `molecule_id`, `target_id` (P56817), `predicted_pic50`, `model_name` |
 
-Access: `from database.db import DatabaseManager` - `DatabaseManager` is the single gateway; no raw SQL is written outside `db.py`.
+Access: `from database.db import DatabaseManager` — `DatabaseManager` is the single gateway; no raw SQL is written outside `db.py`.
 
 **Note on `nn_source` / `nn_id`:** these are intentionally blank for PASS molecules with S_nov = 1.000. No near-neighbor was found above the FLAG threshold, so there is no compound to report. They are only populated for FLAG molecules (patent hits).
 
@@ -321,8 +339,8 @@ Four tabs, all reading live from `runs/triflag.db`:
 
 | Tab | Description |
 |-----|-------------|
-| **Single Molecule** | SMILES input -> decision badge, score breakdown, descriptors, PAINS status, rationale |
-| **Batch Upload** | CSV of SMILES -> run all -> download results as CSV or JSONL |
+| **Single Molecule** | SMILES input → decision badge, score breakdown, descriptors, PAINS status, rationale |
+| **Batch Upload** | CSV of SMILES → run all → download results as CSV or JSONL |
 | **Generation Analytics** | Loop status panel, top candidates table, reward trajectory and diversity plots |
 | **AI Reviewer** | Generate a structured prompt for Claude to independently review a triage decision |
 
@@ -351,17 +369,17 @@ Four tabs, all reading live from `runs/triflag.db`:
 
 ## Known Issues
 
-**`get_generation_progress` denominator** - Uses ~4,160 as its baseline, not the `total_smiles` config value of 6,400. Use `get_generation_stats` for accurate completion percentage.
+**`get_generation_progress` denominator** — Uses ~4,160 as its baseline, not the `total_smiles` config value of 6,400. Use `get_generation_stats` for accurate completion percentage.
 
-**Gen 0 not comparable to Gens 1–7** - Gen 0 used a 3-component reward without S_act and with `SKIP_SIMILARITY=1`. S_act was added in Gen 1, which structurally reduces mean reward (fourth multiplicative factor in [0,1]). RL learning trend analysis starts at Gen 1.
+**Gen 0 not comparable to Gens 1–7** — Gen 0 used a 3-component reward without S_act and with `SKIP_SIMILARITY=1`. S_act was added in Gen 1, which structurally reduces mean reward (fourth multiplicative factor in [0,1]). RL learning trend analysis starts at Gen 1.
 
-**SureChEMBL API availability** - The 2024 async API rebuild removed the legacy sync endpoint. If EBI is unreachable, `triage_molecule` fails at connection stage. Use `skip_similarity=True` for offline use (disables IP screening). The pre-rebuild implementation is preserved at `tools/similarity_tool_backup_gen1.py`.
+**SureChEMBL API availability** — The 2024 async API rebuild removed the legacy sync endpoint. If EBI is unreachable, `triage_molecule` fails at connection stage. Use `skip_similarity=True` for offline use (disables IP screening). The pre-rebuild implementation is preserved at `tools/similarity_tool_backup_gen1.py`.
 
-**DeepPurpose on Windows** - Set `TRIFLAG_ENABLE_DEEPPURPOSE=1` before all other imports. Exit code `0xC0000139` (`shm.dll`) on bare import cannot be caught by Python `try/except`.
+**DeepPurpose on Windows** — Set `TRIFLAG_ENABLE_DEEPPURPOSE=1` before all other imports. Exit code `0xC0000139` (`shm.dll`) on bare import cannot be caught by Python `try/except`.
 
-**ACEGEN warm-start patching** - Do not modify files inside `acegen-open/`. The warm-start mechanism patches `reinvent.py` in memory at runtime via string injection. Source changes will silently break the injection points.
+**ACEGEN warm-start patching** — Do not modify files inside `acegen-open/`. The warm-start mechanism patches `reinvent.py` in memory at runtime via string injection. Source changes will silently break the injection points.
 
-**BACE1 sequence** - Must be the full 501-residue UniProt P56817 sequence in `target/target_config.py`. A 487-residue truncated version (missing the catalytic aspartyl dyad) was corrected during development.
+**BACE1 sequence** — Must be the full 501-residue UniProt P56817 sequence in `target/target_config.py`. A 487-residue truncated version (missing the catalytic aspartyl dyad) was corrected during development.
 
 ---
 
@@ -378,5 +396,3 @@ Four tabs, all reading live from `runs/triflag.db`:
 ---
 
 *Built within the [OSDD2](https://osdd2.org/) framework at UAB SPARC. All 34,915 molecules and full source available at https://github.com/kjamescasper/TRI_FLAG.*
-
-*Oracle APEX public URL: https://oracleapex.com/ords/r/info_triflag/tri-flag/home*
